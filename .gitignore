@@ -1,0 +1,7 @@
+config.json
+*.backup-*
+__pycache__/
+*.log
+*.mp4
+*.ts
+*.part
