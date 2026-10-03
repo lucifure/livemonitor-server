@@ -1,8 +1,9 @@
-import hmac, json, os, shutil, threading
+import hmac, json, os, re, shutil, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote, quote
 
 VALID_QUALITIES = ("360p", "480p", "720p", "1080p", "best")
+CHANNEL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def start_api(config, ctx):
@@ -18,18 +19,22 @@ def start_api(config, ctx):
     def in_progress(name):
         return any(name.startswith(p + ".") for p in ctx["active_prefixes"]())
 
+    output_root = os.path.realpath(output_dir)
+
     def safe_path(raw_name):
         name = unquote(raw_name)
         if not name or name in (".", "..") or name != os.path.basename(name):
             return None, None
         path = os.path.join(output_dir, name)
-        if not os.path.isfile(path):
+        # A recording must be a real file within output_dir, not a symlink
+        # pointing somewhere else on the VM.
+        if not os.path.isfile(path) or os.path.islink(path) or os.path.commonpath((output_root, os.path.realpath(path))) != output_root:
             return None, None
         return name, path
 
     def safe_channel_name(raw_name):
         name = unquote(raw_name)
-        if not name or not all(c.isalnum() or c in "_-" for c in name):
+        if not CHANNEL_NAME_RE.fullmatch(name):
             return None
         return name
 
@@ -90,6 +95,8 @@ def start_api(config, ctx):
                 if os.path.isdir(output_dir):
                     for entry in os.scandir(output_dir):
                         if entry.is_file():
+                            if entry.is_symlink():
+                                continue
                             st = entry.stat()
                             items.append({
                                 "name": entry.name,
@@ -163,9 +170,10 @@ def start_api(config, ctx):
                 name = (body or {}).get("name", "")
                 url = (body or {}).get("url", "")
                 quality = (body or {}).get("quality", "480p")
-                if not isinstance(name, str) or not all(c.isalnum() or c in "_-" for c in name) or not name:
+                if not isinstance(name, str) or not CHANNEL_NAME_RE.fullmatch(name):
                     return self.send_json(400, {"error": "name must be non-empty, letters/digits/_/- only"})
-                if not isinstance(url, str) or not url.startswith("https://www.youtube.com/"):
+                parsed_url = urlparse(url) if isinstance(url, str) else None
+                if not parsed_url or parsed_url.scheme != "https" or parsed_url.hostname not in ("youtube.com", "www.youtube.com"):
                     return self.send_json(400, {"error": "url must be a youtube.com URL"})
                 if quality not in VALID_QUALITIES:
                     return self.send_json(400, {"error": f"quality must be one of {VALID_QUALITIES}"})
@@ -215,7 +223,28 @@ def start_api(config, ctx):
                 return self.send_json(200, {"removed": name})
             return self.send_json(404, {"error": "not found"})
 
-    server = ThreadingHTTPServer((bind, port), Handler)
+    # Tailscale can be unavailable at boot.  Binding in this daemon keeps the
+    # recorder alive and retries until its configured address is usable.
+    def serve_when_available():
+        while True:
+            try:
+                server = ThreadingHTTPServer((bind, port), Handler)
+                server.daemon_threads = True
+                print(f"API listening on {bind}:{port}", flush=True)
+                server.serve_forever()
+                return
+            except OSError as error:
+                print(f"API bind failed on {bind}:{port}; retrying in 5 seconds: {error}", flush=True)
+                time.sleep(5)
+
+    # Bind synchronously when possible so callers can immediately use the
+    # server (and tests can close it); fall back to the retry thread on boot.
+    try:
+        server = ThreadingHTTPServer((bind, port), Handler)
+    except OSError:
+        thread = threading.Thread(target=serve_when_available, daemon=True)
+        thread.start()
+        return thread
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"API listening on {bind}:{port}", flush=True)
