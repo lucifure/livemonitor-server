@@ -1,0 +1,15 @@
+[Unit]
+Description=LiveMonitor YouTube live stream recorder
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/livemonitor-server
+ExecStart=/home/ubuntu/livemonitor-server/.venv/bin/python /home/ubuntu/livemonitor-server/livemonitor_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

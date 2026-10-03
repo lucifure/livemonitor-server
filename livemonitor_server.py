@@ -5,9 +5,14 @@ from datetime import datetime
 
 import api_server
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-YTDLP_BIN = shutil.which("yt-dlp") or os.path.expanduser("~/.local/bin/yt-dlp")
-FFMPEG_BIN = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(PROJECT_DIR, "config.json")
+# deploy/setup.sh installs yt-dlp into this venv and ffmpeg with apt.  Keep
+# fallbacks so `python3 livemonitor_server.py` also remains useful outside it.
+YTDLP_BIN = (os.path.join(PROJECT_DIR, ".venv", "bin", "yt-dlp")
+             if os.path.isfile(os.path.join(PROJECT_DIR, ".venv", "bin", "yt-dlp"))
+             else (shutil.which("yt-dlp") or os.path.expanduser("~/.local/bin/yt-dlp")))
+FFMPEG_BIN = "/usr/bin/ffmpeg" if os.path.isfile("/usr/bin/ffmpeg") else (shutil.which("ffmpeg") or "ffmpeg")
 LOG_BUFFER = deque(maxlen=500)
 STATE = {}
 STATE_LOCK = threading.Lock()
