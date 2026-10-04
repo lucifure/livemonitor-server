@@ -192,7 +192,7 @@ def test_yt_dlp_bot_output_sets_blocked_error_and_uses_five_line_tail(tmp_path, 
     monkeypatch.setattr(server.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**12))
     monkeypatch.setattr(server, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "01012026" if "%d" in fmt else "00-00-00")))
     lines = ["one", "two", "three", "four", "five", "Sign in to confirm", "seven"]
-    monkeypatch.setattr(server.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="\\n".join(lines)))
+    monkeypatch.setattr(server.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="\n".join(lines)))
     monkeypatch.setattr(server.os, "listdir", lambda p: [])
     assert server.record_stream("a", "abc", "show", "", str(tmp_path), "480p") is False
     assert server.STATE["a"]["last_error"] == "YouTube blocked this network (bot or consent check)"
