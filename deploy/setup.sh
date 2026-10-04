@@ -17,6 +17,11 @@ if [[ ! -f "$PROJECT_DIR/deploy/livemonitor.service" ]]; then
     exit 1
 fi
 
+if [[ ! -x /home/ubuntu/.deno/bin/deno ]]; then
+    echo "Warning: Deno was not found at /home/ubuntu/.deno/bin/deno."
+    echo "LiveMonitor can still start, but features that need Deno may not work."
+fi
+
 echo "Installing Ubuntu packages..."
 sudo apt-get update
 sudo apt-get install --yes python3-venv ffmpeg git
