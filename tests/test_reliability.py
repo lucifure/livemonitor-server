@@ -29,6 +29,14 @@ def clean_state(monkeypatch):
     monkeypatch.setattr(server, "log", lambda name, message: server.LOG_BUFFER.append(message))
 
 
+FIXTURES = {
+    "live": "<script>ytInitialPlayerResponse = {\\"videoDetails\\":{\\"videoId\\":\\"abc\\",\\"title\\":\\"A live show\\",\\"isLiveContent\\":true},\\"playabilityStatus\\":{\\"status\\":\\"OK\\"},\\"streamingData\\":{\\"hlsManifestUrl\\":\\"https://example/live\\"}};</script>",
+    "normal": "<html><script>var ytInitialData = {}; var channelMetadata = {};</script></html>",
+    "blocked": "<html>Unusual traffic. Please confirm you're not a bot.</html>",
+    "unexpected": "<html><body>Something completely different</body></html>",
+}
+
+
 def player_html(live=True):
     data = {"videoDetails": {"videoId": "abc", "title": "A live show", "isLiveContent": live}, "playabilityStatus": {"status": "OK"}, "streamingData": {"hlsManifestUrl": "https://example/live"}}
     return "<script>ytInitialPlayerResponse = " + json.dumps(data) + ";</script>"
@@ -141,3 +149,52 @@ def test_main_logs_version_before_starting_workers(monkeypatch, tmp_path):
         server.main()
     assert any("version deadbee" in line for line in server.LOG_BUFFER)
     assert server.GLOBALS["min_free_gb"] == 4
+
+
+def response(html, url="https://www.youtube.com/@a"):
+    return SimpleNamespace(status_code=200, text=html, url=url)
+
+
+@pytest.mark.parametrize("fixture, expected", [
+    ("live", "live"),
+    ("normal", "not_live"),
+    ("blocked", "blocked"),
+    ("unexpected", "unexpected"),
+])
+def test_page_classification_fixtures(fixture, expected):
+    kind, info = server._classify_page(response(FIXTURES[fixture]))
+    assert kind == expected
+    if expected == "live":
+        assert info["video_id"] == "abc"
+
+
+def test_blocked_page_is_throttled_and_backs_off(monkeypatch):
+    server.set_state("a", status="idle")
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(FIXTURES["blocked"]))
+    assert server.check_live("https://youtube.com/@a", "", "a") is None
+    assert server.STATE["a"]["last_error"] == "YouTube blocked this network (bot or consent check)"
+    assert server.STATE["a"]["backoff_seconds"] == 600
+    assert len(server.LOG_BUFFER) == 1
+    server.check_live("https://youtube.com/@a", "", "a")
+    assert len(server.LOG_BUFFER) == 1
+
+
+def test_normal_page_clears_error_without_logging(monkeypatch):
+    server.set_state("a", status="idle", last_error="old error")
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(FIXTURES["normal"]))
+    assert server.check_live("https://youtube.com/@a", "", "a") is None
+    assert server.STATE["a"]["last_error"] is None
+    assert server.LOG_BUFFER == []
+
+
+def test_yt_dlp_bot_output_sets_blocked_error_and_uses_five_line_tail(tmp_path, monkeypatch):
+    server.GLOBALS["min_free_gb"] = 0
+    monkeypatch.setattr(server.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**12))
+    monkeypatch.setattr(server, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "01012026" if "%d" in fmt else "00-00-00")))
+    lines = ["one", "two", "three", "four", "five", "Sign in to confirm", "seven"]
+    monkeypatch.setattr(server.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="\\n".join(lines)))
+    monkeypatch.setattr(server.os, "listdir", lambda p: [])
+    assert server.record_stream("a", "abc", "show", "", str(tmp_path), "480p") is False
+    assert server.STATE["a"]["last_error"] == "YouTube blocked this network (bot or consent check)"
+    assert server.STATE["a"]["backoff_seconds"] == 600
+    assert any("Sign in to confirm" in x and "seven" in x for x in server.LOG_BUFFER)
