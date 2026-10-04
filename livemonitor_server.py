@@ -234,8 +234,15 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, errors="replace")
         log(channel_name, f"yt-dlp exited with code {result.returncode}")
-        if result.returncode:
-            tail = "\n".join((result.stdout or "").splitlines()[-10:])
+        output = result.stdout or ""
+        lowered = output.lower()
+        if "sign in to confirm" in lowered or "not a bot" in lowered:
+            tail = "\n".join(output.splitlines()[-5:])
+            message = "YouTube blocked this network (bot or consent check)"
+            log(channel_name, f"{message}; yt-dlp output tail: {tail or '(no output)'}")
+            set_state(channel_name, last_error=message, backoff_seconds=600)
+        elif result.returncode:
+            tail = "\n".join(output.splitlines()[-10:])
             log(channel_name, f"yt-dlp failed; output tail: {tail or '(no output)'}")
             set_state(channel_name, last_error=f"yt-dlp exited with code {result.returncode}")
 
@@ -293,8 +300,7 @@ def monitor_channel(channel):
             set_state(name, last_check=int(time.time()))
             if live_info:
                 log(name, f"LIVE detected: {live_info['title']} ({live_info['video_id']})")
-                record_stream(name, live_info["video_id"], live_info["title"], proxy, output_dir, quality)
-                just_recorded = True
+                just_recorded = record_stream(name, live_info["video_id"], live_info["title"], proxy, output_dir, quality)
         except Exception as e:
             log(name, f"monitor loop error: {e}")
             set_state(name, last_error=f"monitor loop error: {e}")
