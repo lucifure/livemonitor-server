@@ -22,7 +22,7 @@ These instructions are for the Ubuntu VM. They use the project folder
 
 `setup.sh` deliberately stops if `config.json` is missing. It installs Ubuntu
 packages, creates `.venv`, installs the pinned Python packages, and starts the
-`livemonitor` service.
+`livemonitor` service. The systemd service adds `/home/ubuntu/.deno/bin` to its PATH so Deno installed for the `ubuntu` user can be found. The setup script warns if `/home/ubuntu/.deno/bin/deno` is missing.
 
 ## Update after a GitHub merge
 
