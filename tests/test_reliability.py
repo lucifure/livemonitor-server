@@ -30,10 +30,10 @@ def clean_state(monkeypatch):
 
 
 FIXTURES = {
-    "live": "<script>ytInitialPlayerResponse = {\\"videoDetails\\":{\\"videoId\\":\\"abc\\",\\"title\\":\\"A live show\\",\\"isLiveContent\\":true},\\"playabilityStatus\\":{\\"status\\":\\"OK\\"},\\"streamingData\\":{\\"hlsManifestUrl\\":\\"https://example/live\\"}};</script>",
-    "normal": "<html><script>var ytInitialData = {}; var channelMetadata = {};</script></html>",
-    "blocked": "<html>Unusual traffic. Please confirm you're not a bot.</html>",
-    "unexpected": "<html><body>Something completely different</body></html>",
+    "live": '''<script>ytInitialPlayerResponse = {"videoDetails":{"videoId":"abc","title":"A live show","isLiveContent":true},"playabilityStatus":{"status":"OK"},"streamingData":{"hlsManifestUrl":"https://example/live"}};</script>''',
+    "normal": '''<html><script>var ytInitialData = {}; var channelMetadata = {};</script></html>''',
+    "blocked": '''<html>Unusual traffic. Please confirm you're not a bot.</html>''',
+    "unexpected": '''<html><body>Something completely different</body></html>''',
 }
 
 
