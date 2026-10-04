@@ -168,6 +168,22 @@ def test_page_classification_fixtures(fixture, expected):
         assert info["video_id"] == "abc"
 
 
+def test_consent_redirect_is_blocked(monkeypatch):
+    server.set_state("a", status="idle")
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response("<html>consent</html>", "https://consent.youtube.com/m=0"))
+    assert server.check_live("https://youtube.com/@a", "", "a") is None
+    assert server.STATE["a"]["last_error"] == "YouTube blocked this network (bot or consent check)"
+    assert server.STATE["a"]["backoff_seconds"] == 600
+
+
+def test_login_required_is_blocked(monkeypatch):
+    html = '<script>ytInitialPlayerResponse = {"playabilityStatus":{"status":"LOGIN_REQUIRED"}};</script>'
+    server.set_state("a", status="idle")
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(html))
+    assert server.check_live("https://youtube.com/@a", "", "a") is None
+    assert server.STATE["a"]["last_error"] == "YouTube blocked this network (bot or consent check)"
+
+
 def test_blocked_page_is_throttled_and_backs_off(monkeypatch):
     server.set_state("a", status="idle")
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(FIXTURES["blocked"]))
