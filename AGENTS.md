@@ -32,15 +32,16 @@ The responses of api_server.py today are the contract. The app uses at least:
 | GET /logs?limit=N | {lines:[...]} |
 
 ## Behaviour rules
-1. Errors never change a channel's status. Only an explicit user action through the API (stop/pause) sets `paused`. A failed check, proxy error, HTTP error or unexpected page is logged, stored in last_error, and retried on the next poll. last_error is cleared on the next success. On HTTP 429 or consent/bot-check pages back off up to 5 minutes but keep retrying.
-2. "Cannot tell" is not "not live". If the page has no player data or looks like a consent/bot-check page, log "unexpected page" and set last_error. Never fail silently.
-3. A channel the user paused stays paused after a restart. Everything else starts as idle.
-4. If a recording ends while the stream is still live, start a new recording after a short delay. If yt-dlp fails or produces no file, log the last lines of its output.
-5. Refuse to start a recording when free disk is below config `min_free_gb` (default 3). Set last_error and keep checking.
-6. Never send JSON null for title, last_error or video_id. Send "" instead (the app prints the word "null").
-7. Log the server version (git short hash) at startup and include `version` in /status.
-8. Security: constant-time token comparison; validate channel names (^[A-Za-z0-9_-]{1,64}$) and URLs (https only, host youtube.com or www.youtube.com); /recordings endpoints serve only plain file names inside output_dir (no path traversal, no symlink escape); never log the token.
-9. If `proxy` is set and a request fails with a proxy error, retry once directly and log which path worked.
+1. Errors never change a channel's status. Only an explicit user action through the API (stop/pause) sets `paused`. Clear `last_error` after a successful live or normal non-live page check.
+2. Classify every HTTP 200 YouTube page: a playable live player response is live; a normal channel/watch page with `ytInitialData` or channel metadata and no block markers is not live; consent redirects, unusual-traffic/bot prompts, and `LOGIN_REQUIRED` are blocked; anything else is an unexpected page. Blocked checks set `last_error` to `YouTube blocked this network (bot or consent check)`, log at most once per 10 minutes, and wait 10 minutes before checking that channel again. Unexpected pages set `last_error` to `unexpected page` and log at most once per hour.
+3. If yt-dlp output contains `Sign in to confirm` or `not a bot`, use the same blocked error, log its last five output lines, wait 10 minutes, and keep monitoring. Never set `paused` for an error.
+4. A channel the user paused stays paused after a restart. Everything else starts as idle.
+5. If a recording ends while the stream is still live, start a new recording after a short delay. If yt-dlp fails or produces no file, log the last lines of its output.
+6. Refuse to start a recording when free disk is below config `min_free_gb` (default 3). Set `last_error` and keep checking.
+7. Never send JSON null for title, last_error or video_id. Send "" instead (the app prints the word "null").
+8. Log the server version (git short hash) at startup and include `version` in /status.
+9. Security: constant-time token comparison; validate channel names (^[A-Za-z0-9_-]{1,64}$) and URLs (https only, host youtube.com or www.youtube.com); /recordings endpoints serve only plain file names inside output_dir (no path traversal, no symlink escape); never log the token.
+10. If `proxy` is set and a request fails with a proxy error, retry once directly and log which path worked.
 
 ## Definition of done
 Tests pass locally and in CI, and the PR description follows hard rule 6.
