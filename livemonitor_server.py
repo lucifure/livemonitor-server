@@ -19,6 +19,7 @@ STATE_LOCK = threading.Lock()
 CONFIG_LOCK = threading.Lock()
 CONTROL = {}
 STARTED_AT = int(time.time())
+CLASSIFICATION_LOGGED_AT = {}
 GLOBALS = {}
 
 
@@ -126,75 +127,78 @@ def extract_balanced_json(html, marker):
     return None
 
 
+def _log_throttled(name, key, message, interval):
+    now = time.time()
+    last = CLASSIFICATION_LOGGED_AT.get((name, key), 0)
+    if now - last >= interval:
+        log(name, message)
+        CLASSIFICATION_LOGGED_AT[(name, key)] = now
+
+def _classify_page(resp):
+    html = resp.text or ''
+    low = html.lower()
+    url = (getattr(resp, 'url', '') or '').lower()
+    if 'consent.youtube.com' in url or 'consent.youtube.com' in low:
+        return 'blocked', None
+    if any(x in low for x in ('unusual traffic', "confirm you're not a bot", 'confirm you are not a bot', 'sign in to confirm', 'not a bot', 'login_required')):
+        return 'blocked', None
+    data = extract_balanced_json(html, 'ytInitialPlayerResponse')
+    if data:
+        details = data.get('videoDetails') or {}
+        play = data.get('playabilityStatus') or {}
+        if str(play.get('status', '')).upper() == 'LOGIN_REQUIRED':
+            return 'blocked', None
+        vid = details.get('videoId', '')
+        stream = data.get('streamingData') or {}
+        playable = bool(stream.get('hlsManifestUrl') or stream.get('formats') or stream.get('adaptiveFormats'))
+        if vid and details.get('isLiveContent') and play.get('status') == 'OK' and playable:
+            return 'live', {'video_id': vid, 'title': details.get('title', vid)}
+        if vid:
+            return 'not_live', None
+    if any(x in low for x in ('ytinitialdata', 'channelmetadata', 'channel_id', 'channelid')) or 'youtube.com/channel/' in url:
+        return 'not_live', None
+    return 'unexpected', None
+
 def check_live(channel_url, proxy, channel_name):
     import requests
     def request(using_proxy):
         options = dict(request_options)
         if using_proxy:
-            options["proxies"] = {"http": proxy, "https": proxy}
+            options['proxies'] = {'http': proxy, 'https': proxy}
         return requests.get(channel_url, **options)
-
     try:
-        request_options = {
-            "headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-            "timeout": 20,
-        }
+        request_options = {'headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}, 'timeout': 20}
         resp = request(bool(proxy))
     except Exception as e:
-        # A configured proxy gets exactly one direct retry.  This is useful
-        # when the local proxy has restarted, but avoids hiding other errors.
-        if proxy and ("proxy" in str(e).lower() or isinstance(e, requests.exceptions.ProxyError)):
-            log(channel_name, f"live-check via proxy failed: {e}; retrying directly")
+        if proxy and ('proxy' in str(e).lower() or isinstance(e, requests.exceptions.ProxyError)):
+            log(channel_name, f'live-check via proxy failed: {e}; retrying directly')
             try:
                 resp = request(False)
-                log(channel_name, "live-check succeeded directly after proxy failure")
-            except Exception as direct_error:
-                log(channel_name, f"live-check direct retry failed: {direct_error}")
-                set_state(channel_name, last_error=f"request failed: {direct_error}")
+                log(channel_name, 'live-check succeeded directly after proxy failure')
+            except Exception as err:
+                log(channel_name, f'live-check direct retry failed: {err}')
+                set_state(channel_name, last_error=f'request failed: {err}')
                 return None
         else:
-            log(channel_name, f"live-check request failed: {e}")
-            set_state(channel_name, last_error=f"request failed: {e}")
+            log(channel_name, f'live-check request failed: {e}')
+            set_state(channel_name, last_error=f'request failed: {e}')
             return None
-
     if resp.status_code != 200:
-        log(channel_name, f"live-check got HTTP {resp.status_code}")
-        set_state(channel_name, last_error=f"HTTP {resp.status_code}",
-                  backoff_seconds=300 if resp.status_code == 429 else 0)
+        log(channel_name, f'live-check got HTTP {resp.status_code}')
+        set_state(channel_name, last_error=f'HTTP {resp.status_code}', backoff_seconds=300 if resp.status_code == 429 else 0)
         return None
-
-    data = extract_balanced_json(resp.text, "ytInitialPlayerResponse")
-    if not data:
-        log(channel_name, "unexpected page: no player data (possibly consent or bot-check)")
-        set_state(channel_name, last_error="unexpected page: no player data", backoff_seconds=300)
-        return None
-
-    video_details = data.get("videoDetails") or {}
-    playability = data.get("playabilityStatus") or {}
-    streaming_data = data.get("streamingData") or {}
-
-    video_id = video_details.get("videoId", "")
-    if not video_id:
-        log(channel_name, "unexpected page: player data has no video id")
-        set_state(channel_name, last_error="unexpected page: no video id", backoff_seconds=300)
-        return None
-
-    status_ok = playability.get("status", "") == "OK"
-    is_live_content = bool(video_details.get("isLiveContent"))
-    has_playable = bool(
-        streaming_data.get("hlsManifestUrl")
-        or streaming_data.get("formats")
-        or streaming_data.get("adaptiveFormats")
-    )
-
-    if not (status_ok and is_live_content and has_playable):
-        # This is a successful non-live check, not an error.
+    kind, info = _classify_page(resp)
+    if kind in ('live', 'not_live'):
         set_state(channel_name, last_error=None, backoff_seconds=0)
+        return info
+    if kind == 'blocked':
+        msg = 'YouTube blocked this network (bot or consent check)'
+        _log_throttled(channel_name, 'blocked', msg, 600)
+        set_state(channel_name, last_error=msg, backoff_seconds=600)
         return None
-
-    set_state(channel_name, last_error=None, backoff_seconds=0)
-    return {"video_id": video_id, "title": video_details.get("title", video_id)}
-
+    _log_throttled(channel_name, 'unexpected', 'unexpected page', 3600)
+    set_state(channel_name, last_error='unexpected page', backoff_seconds=0)
+    return None
 
 def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
     os.makedirs(output_dir, exist_ok=True)
