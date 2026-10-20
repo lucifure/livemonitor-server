@@ -1,5 +1,6 @@
 import json
 import io
+import os
 import signal
 import subprocess
 import threading
@@ -222,7 +223,8 @@ def test_ffmpeg_failure_keeps_ts_and_reports_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(server.os, "listdir", listdir)
     assert server.record_stream("a", "abc", "show", "", str(tmp_path), "480p") is False
     assert ts.read_bytes() == b"video"
-    assert "keeping original .ts" in server.STATE["a"]["last_error"]
+    assert server.STATE["a"]["last_error"]
+    assert any("Could not convert" in line for line in server.LOG_BUFFER)
 
 
 def test_ytdlp_command_omits_certificate_bypass(tmp_path, monkeypatch):
@@ -243,7 +245,8 @@ def test_change_me_disables_api(capsys, tmp_path):
 
 def test_missing_proxy_config_defaults_to_direct(monkeypatch, tmp_path):
     config = tmp_path / "config.json"
-    config.write_text(json.dumps({"channels": [], "api_token": "", "min_free_gb": 4}))
+    config.write_text(json.dumps({"channels": [], "api_token": "", "min_free_gb": 4,
+                                  "output_dir": str(tmp_path / "recordings")}))
     monkeypatch.setattr(server, "CONFIG_PATH", str(config))
     monkeypatch.setattr(server, "server_version", lambda: "deadbee")
     monkeypatch.setattr(server.api_server, "start_api", lambda *args: None)
@@ -395,9 +398,222 @@ def test_not_live_success_resets_failure_streak(monkeypatch):
     assert waits == [30, 60, 30]
 
 
+def _probe_json(path):
+    if ".f135." in path:
+        streams = [{"codec_type": "video", "codec_name": "h264"}]
+    elif ".f140." in path:
+        streams = [{"codec_type": "audio", "codec_name": "aac"}]
+    elif ".f141." in path:
+        streams = [{"codec_type": "video", "codec_name": "vp9"}]
+    elif ".f142." in path:
+        streams = [{"codec_type": "audio", "codec_name": "opus"}]
+    else:
+        streams = [{"codec_type": "video", "codec_name": "h264"}]
+    return SimpleNamespace(returncode=0, stdout=json.dumps({"streams": streams}))
+
+
+def test_parts_are_merged_then_deleted(tmp_path, monkeypatch):
+    base = "show_20102026_02-26-35"
+    video = tmp_path / f"{base}.f135.mp4"
+    audio = tmp_path / f"{base}.f140.m4a"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    commands = []
+    def run(cmd, **kwargs):
+        if cmd[0] == server.FFPROBE_BIN:
+            return _probe_json(cmd[-1])
+        commands.append(cmd)
+        (tmp_path / f"{base}.mp4").write_bytes(b"merged")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(server.subprocess, "run", run)
+    result = server.finalize_recording_output(str(tmp_path), base, "a")
+    assert result == str(tmp_path / f"{base}.mp4")
+    assert not video.exists() and not audio.exists()
+    assert (tmp_path / f"{base}.mp4").read_bytes() == b"merged"
+    assert "-map" in commands[0] and "-c" in commands[0] and "copy" in commands[0]
+    assert "-map" in commands[0] and "0:v:0" in commands[0] and "1:a:0" in commands[0]
+
+
+def test_existing_final_file_is_used_when_there_are_no_parts(tmp_path, monkeypatch):
+    final = tmp_path / "show.mkv"
+    final.write_bytes(b"complete recording")
+    monkeypatch.setattr(server.subprocess, "run", lambda *args, **kwargs: pytest.fail("ffmpeg should not run"))
+    assert server.finalize_recording_output(str(tmp_path), "show", "a") == str(final)
+
+
+def test_incompatible_parts_merge_to_mkv(tmp_path, monkeypatch):
+    base = "show"
+    (tmp_path / f"{base}.f135.mp4").write_bytes(b"video")
+    (tmp_path / f"{base}.f140.m4a").write_bytes(b"audio")
+    merge = []
+    def run(cmd, **kwargs):
+        if cmd[0] == server.FFPROBE_BIN:
+            codec = "hevc" if ".f135." in cmd[-1] else "opus"
+            stream_type = "video" if codec == "hevc" else "audio"
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"streams": [{"codec_type": stream_type,
+                                                                                    "codec_name": codec}]}))
+        merge.append(cmd)
+        (tmp_path / f"{base}.mkv").write_bytes(b"merged")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(server.subprocess, "run", run)
+    assert server.finalize_recording_output(str(tmp_path), base, "a").endswith("show.mkv")
+
+
+def test_failed_merge_keeps_every_part_and_reports_failure(tmp_path, monkeypatch):
+    base = "show"
+    video = tmp_path / f"{base}.f135.mp4"
+    audio = tmp_path / f"{base}.f140.m4a"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    monkeypatch.setattr(server.subprocess, "run", lambda cmd, **kwargs: (
+        _probe_json(cmd[-1]) if cmd[0] == server.FFPROBE_BIN else SimpleNamespace(returncode=1, stdout="", stderr="bad")
+    ))
+    assert server.finalize_recording_output(str(tmp_path), base, "a") is False
+    assert video.exists() and audio.exists()
+    assert any("Could not merge parts" in line and video.name in line and audio.name in line
+               for line in server.LOG_BUFFER)
+
+
+def test_merge_retries_once_with_ignore_err(tmp_path, monkeypatch):
+    base = "show"
+    (tmp_path / f"{base}.f135.mp4").write_bytes(b"video")
+    (tmp_path / f"{base}.f140.m4a").write_bytes(b"audio")
+    merge_commands = []
+    def run(cmd, **kwargs):
+        if cmd[0] == server.FFPROBE_BIN:
+            return _probe_json(cmd[-1])
+        merge_commands.append(cmd)
+        if len(merge_commands) == 2:
+            (tmp_path / f"{base}.mp4").write_bytes(b"merged")
+            return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=1)
+    monkeypatch.setattr(server.subprocess, "run", run)
+    assert server.finalize_recording_output(str(tmp_path), base, "a").endswith(f"{base}.mp4")
+    assert len(merge_commands) == 2
+    assert "-err_detect" in merge_commands[1] and "ignore_err" in merge_commands[1]
+
+
+def test_single_video_part_is_kept_and_not_reported_saved(tmp_path, monkeypatch):
+    base = "show"
+    video = tmp_path / f"{base}.f135.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(server.subprocess, "run", lambda *args, **kwargs: _probe_json(str(video)))
+    assert server.finalize_recording_output(str(tmp_path), base, "a") is False
+    assert video.exists()
+    assert any("only a video part was found" in line for line in server.LOG_BUFFER)
+    assert not any("Recording saved" in line for line in server.LOG_BUFFER)
+
+
+def test_part_merge_order_is_independent_of_listdir_order(tmp_path, monkeypatch):
+    base = "show"
+    names = [f"{base}.f142.m4a", f"{base}.f141.mp4", f"{base}.f140.m4a", f"{base}.f135.mp4"]
+    for name in names:
+        (tmp_path / name).write_bytes(name.encode())
+    real_listdir = server.os.listdir
+    monkeypatch.setattr(server.os, "listdir", lambda path: list(reversed(real_listdir(path))))
+    merge = []
+    def run(cmd, **kwargs):
+        if cmd[0] == server.FFPROBE_BIN:
+            return _probe_json(cmd[-1])
+        merge.append(cmd)
+        (tmp_path / f"{base}.mp4").write_bytes(b"merged")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(server.subprocess, "run", run)
+    assert server.finalize_recording_output(str(tmp_path), base, "a").endswith(f"{base}.mp4")
+    assert merge[0][merge[0].index("-i") + 1].endswith(".f135.mp4")
+    assert merge[0][merge[0].index("-i", merge[0].index("-i") + 1) + 1].endswith(".f140.m4a")
+
+
+def test_nonzero_ytdlp_exit_salvages_parts_but_returns_failure(tmp_path, monkeypatch):
+    server.GLOBALS["min_free_gb"] = 0
+    monkeypatch.setattr(server.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**12))
+    monkeypatch.setattr(server, "sanitize_filename", lambda title: "show")
+    monkeypatch.setattr(server, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "20102026" if "%d" in fmt else "02-26-35")))
+    base = "show_20102026_02-26-35"
+    def popen(*args, **kwargs):
+        (tmp_path / f"{base}.f135.mp4").write_bytes(b"video")
+        (tmp_path / f"{base}.f140.m4a").write_bytes(b"audio")
+        return FakeProcess(1, "failed\n")
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    def run(cmd, **kwargs):
+        if cmd[0] == server.FFPROBE_BIN:
+            return _probe_json(cmd[-1])
+        (tmp_path / f"{base}.mp4").write_bytes(b"merged")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(server.subprocess, "run", run)
+    assert server.record_stream("a", "abc", "show", "", str(tmp_path), "480p") is False
+    assert (tmp_path / f"{base}.mp4").read_bytes() == b"merged"
+    assert not (tmp_path / f"{base}.f135.mp4").exists()
+    assert "yt-dlp exited with code 1" in server.STATE["a"]["last_error"]
+
+
+def test_user_stop_salvages_parts_without_last_error(tmp_path, monkeypatch):
+    server.GLOBALS["min_free_gb"] = 0
+    stop = threading.Event()
+    pause = threading.Event()
+    server.CONTROL["a"] = {"pause": pause, "remove": threading.Event(), "stop_now": stop}
+    monkeypatch.setattr(server.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**12))
+    monkeypatch.setattr(server, "sanitize_filename", lambda title: "show")
+    monkeypatch.setattr(server, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "20102026" if "%d" in fmt else "02-26-35")))
+    base = "show_20102026_02-26-35"
+    process = FakeProcess(None)
+    def popen(*args, **kwargs):
+        (tmp_path / f"{base}.f135.mp4").write_bytes(b"video")
+        (tmp_path / f"{base}.f140.m4a").write_bytes(b"audio")
+        return process
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    monkeypatch.setattr(server.time, "sleep", lambda _: (stop.set(), pause.set()))
+    monkeypatch.setattr(server.os, "killpg", lambda pid, sig: setattr(process, "returncode", 130))
+    def run(cmd, **kwargs):
+        if cmd[0] == server.FFPROBE_BIN:
+            return _probe_json(cmd[-1])
+        (tmp_path / f"{base}.mp4").write_bytes(b"merged")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(server.subprocess, "run", run)
+    assert server.record_stream("a", "abc", "show", "", str(tmp_path), "480p") is True
+    assert (tmp_path / f"{base}.mp4").exists()
+    assert server.STATE["a"].get("last_error") is None
+    assert server.STATE["a"]["status"] == "paused"
+
+
+def test_startup_recovery_merges_old_parts_and_cleans_only_old_empty_parts(tmp_path, monkeypatch):
+    now = 2_000_000_000
+    old_video = tmp_path / "old.f135.mp4"
+    old_audio = tmp_path / "old.f140.m4a"
+    new_video = tmp_path / "new.f135.mp4"
+    active_video = tmp_path / "active.f135.mp4"
+    empty_old = tmp_path / "empty.f137.mp4"
+    empty_new = tmp_path / "empty.f138.mp4"
+    for path, data in ((old_video, b"v"), (old_audio, b"a"), (new_video, b"v"),
+                       (active_video, b"v"), (empty_old, b""), (empty_new, b"")):
+        path.write_bytes(data)
+    for path in (old_video, old_audio, active_video, empty_old):
+        os.utime(path, (now - 700, now - 700))
+    os.utime(new_video, (now - 100, now - 100))
+    os.utime(empty_new, (now - 100, now - 100))
+    monkeypatch.setattr(server.time, "time", lambda: now)
+    monkeypatch.setattr(server, "active_prefixes", lambda: ["active"])
+    merges = []
+    def run(cmd, **kwargs):
+        if cmd[0] == server.FFPROBE_BIN:
+            return _probe_json(cmd[-1])
+        merges.append(cmd)
+        (tmp_path / "old.mp4").write_bytes(b"merged")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(server.subprocess, "run", run)
+    server.recover_recordings(str(tmp_path))
+    assert (tmp_path / "old.mp4").exists()
+    assert not old_video.exists() and not old_audio.exists()
+    assert new_video.exists() and active_video.exists()
+    assert not empty_old.exists()
+    assert empty_new.exists()
+    assert len(merges) == 1
+
+
 def test_main_logs_version_before_starting_workers(monkeypatch, tmp_path):
     config = tmp_path / "config.json"
-    config.write_text(json.dumps({"channels": [], "api_token": "", "min_free_gb": 4}))
+    config.write_text(json.dumps({"channels": [], "api_token": "", "min_free_gb": 4,
+                                  "output_dir": str(tmp_path / "recordings")}))
     monkeypatch.setattr(server, "CONFIG_PATH", str(config))
     monkeypatch.setattr(server, "server_version", lambda: "deadbee")
     monkeypatch.setattr(server.api_server, "start_api", lambda *args: None)

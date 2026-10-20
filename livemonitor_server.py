@@ -13,6 +13,7 @@ YTDLP_BIN = (os.path.join(PROJECT_DIR, ".venv", "bin", "yt-dlp")
              if os.path.isfile(os.path.join(PROJECT_DIR, ".venv", "bin", "yt-dlp"))
              else (shutil.which("yt-dlp") or os.path.expanduser("~/.local/bin/yt-dlp")))
 FFMPEG_BIN = "/usr/bin/ffmpeg" if os.path.isfile("/usr/bin/ffmpeg") else (shutil.which("ffmpeg") or "ffmpeg")
+FFPROBE_BIN = "/usr/bin/ffprobe" if os.path.isfile("/usr/bin/ffprobe") else (shutil.which("ffprobe") or "ffprobe")
 LOG_BUFFER = deque(maxlen=500)
 STATE = {}
 STATE_LOCK = threading.Lock()
@@ -283,6 +284,9 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         duration = max(0, int(time.monotonic() - started))
         set_state(channel_name, last_recording_duration_seconds=duration)
         log(channel_name, f"yt-dlp exited with code {return_code}")
+        set_state(channel_name, status="finalizing")
+        finalized_path = finalize_recording_output(output_dir, base_name, channel_name)
+        cleanup_empty_recording_files(output_dir, base_name)
         if return_code and not stopped_by_user:
             tail = "\n".join(list(output_lines)[-10:])
             log(channel_name, f"yt-dlp failed; output tail: {tail or '(no output)'}")
@@ -290,16 +294,7 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
             cleanup_empty_recording_files(output_dir, base_name)
             return False
 
-        set_state(channel_name, status="finalizing")
-        produced = None
-        for fname in os.listdir(output_dir):
-            if fname.startswith(base_name + "."):
-                candidate = os.path.join(output_dir, fname)
-                if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-                    produced = candidate
-                    break
-
-        if not produced:
+        if finalized_path is None:
             if stopped_by_user:
                 log(channel_name, "Stop requested; nothing was recorded")
                 cleanup_empty_recording_files(output_dir, base_name)
@@ -309,36 +304,15 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
             log(channel_name, f"No output file found; yt-dlp output tail: {tail or '(no output)'}")
             set_state(channel_name, last_error="yt-dlp produced no output file")
             return False
-
-        if produced.endswith(".ts"):
-            mp4_path = produced[:-2] + "mp4"
-            log(channel_name, f"Converting .ts to mp4: {mp4_path}")
-            try:
-                conversion = subprocess.run([FFMPEG_BIN, "-y", "-i", produced, "-c", "copy", mp4_path])
-                if conversion.returncode != 0 or not os.path.isfile(mp4_path) or os.path.getsize(mp4_path) == 0:
-                    message = "ffmpeg conversion failed; keeping original .ts recording"
-                    log(channel_name, message)
-                    if not stopped_by_user:
-                        set_state(channel_name, last_error=message)
-                    cleanup_empty_recording_files(output_dir, base_name)
-                    if stopped_by_user:
-                        succeeded = True
-                        return True
-                    return False
-                os.remove(produced)
-            except OSError as error:
-                message = f"ffmpeg conversion failed; keeping original .ts recording: {error}"
-                log(channel_name, message)
-                if not stopped_by_user:
-                    set_state(channel_name, last_error=message)
+        if finalized_path is False:
+            if stopped_by_user:
                 cleanup_empty_recording_files(output_dir, base_name)
-                if stopped_by_user:
-                    succeeded = True
-                    return True
-                return False
-            log(channel_name, f"Recording saved: {mp4_path}")
-        else:
-            log(channel_name, f"Recording saved (native container, no remux needed): {produced}")
+                succeeded = True
+                return True
+            message = "recording output could not be finalized; source files were kept"
+            set_state(channel_name, last_error=message)
+            cleanup_empty_recording_files(output_dir, base_name)
+            return False
         if duration < 120 and not stopped_by_user:
             message = f"recording ended after {duration}s (under 120s)"
             log(channel_name, message)
@@ -352,6 +326,169 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         final_status = "paused" if stopped_by_user or (ctrl.get("pause") and ctrl["pause"].is_set()) else "idle"
         set_state(channel_name, status=final_status, video_id=None, title=None,
                   recording_started_at=None, base_name=None)
+
+
+def finalize_recording_output(output_dir, base_name, channel_name="server"):
+    """Merge split yt-dlp parts or finalize one native output. Return path, False, or None."""
+    names = sorted(os.listdir(output_dir))
+    part_re = re.compile(r"^" + re.escape(base_name) + r"\.f\d+\.[^.]+$")
+    part_names = [name for name in names if part_re.fullmatch(name)]
+    parts = [os.path.join(output_dir, name) for name in part_names
+             if os.path.isfile(os.path.join(output_dir, name))
+             and os.path.getsize(os.path.join(output_dir, name)) > 0]
+
+    if not parts:
+        for extension in ("mp4", "mkv"):
+            final_path = os.path.join(output_dir, f"{base_name}.{extension}")
+            if os.path.isfile(final_path) and os.path.getsize(final_path) > 0:
+                log(channel_name, f"Recording saved: {final_path}")
+                return final_path
+        ts_path = os.path.join(output_dir, f"{base_name}.ts")
+        if os.path.isfile(ts_path) and os.path.getsize(ts_path) > 0:
+            mp4_path = os.path.join(output_dir, f"{base_name}.mp4")
+            log(channel_name, f"Converting .ts to mp4: {mp4_path}")
+            try:
+                result = subprocess.run([FFMPEG_BIN, "-y", "-i", ts_path, "-c", "copy", mp4_path])
+                if result.returncode == 0 and os.path.isfile(mp4_path) and os.path.getsize(mp4_path) > 0:
+                    os.remove(ts_path)
+                    log(channel_name, f"Recording saved: {mp4_path}")
+                    return mp4_path
+            except OSError as error:
+                log(channel_name, f"Could not convert {ts_path}; original was kept: {error}")
+            log(channel_name, f"Could not convert {ts_path}; original was kept")
+            return False
+        final_re = re.compile(r"^" + re.escape(base_name) + r"\.[^.]+$")
+        for name in names:
+            if not final_re.fullmatch(name):
+                continue
+            final_path = os.path.join(output_dir, name)
+            if os.path.isfile(final_path) and os.path.getsize(final_path) > 0:
+                log(channel_name, f"Recording saved (native container, no remux needed): {final_path}")
+                return final_path
+        return None
+
+    if len(parts) == 1:
+        path = parts[0]
+        try:
+            probe = subprocess.run([FFPROBE_BIN, "-v", "error", "-show_entries",
+                                    "stream=codec_type,codec_name", "-of", "json", path],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stream_types = {s.get("codec_type") for s in json.loads(probe.stdout or "{}").get("streams", [])}
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            stream_types = set()
+        if "video" in stream_types and "audio" not in stream_types:
+            log(channel_name, f"only a video part was found; kept as-is: {os.path.basename(path)}")
+        elif "audio" in stream_types and "video" not in stream_types:
+            log(channel_name, f"only an audio part was found; kept as-is: {os.path.basename(path)}")
+        else:
+            log(channel_name, f"Could not finalize part file; kept as-is: {os.path.basename(path)}")
+        return False
+
+    probes = []
+    for path in parts:
+        try:
+            probe = subprocess.run([FFPROBE_BIN, "-v", "error", "-show_entries",
+                                    "stream=codec_type,codec_name", "-of", "json", path],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if probe.returncode != 0:
+                raise ValueError("ffprobe returned an error")
+            streams = json.loads(probe.stdout or "{}").get("streams", [])
+            probes.append((path, streams))
+        except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as error:
+            log(channel_name, f"Could not inspect part files {', '.join(os.path.basename(p) for p in parts)}: {error}")
+            return False
+
+    video_parts = [(path, next(s for s in streams if s.get("codec_type") == "video"))
+                   for path, streams in probes if any(s.get("codec_type") == "video" for s in streams)]
+    audio_parts = [(path, next(s for s in streams if s.get("codec_type") == "audio"))
+                   for path, streams in probes if any(s.get("codec_type") == "audio" for s in streams)]
+    if not video_parts or not audio_parts:
+        names_text = ", ".join(os.path.basename(p) for p in parts)
+        kind = "video" if video_parts else "audio"
+        log(channel_name, f"Only {kind} parts were found in {names_text}; parts were kept")
+        return False
+
+    video_path, video_stream = video_parts[0]
+    audio_path, audio_stream = audio_parts[0]
+    compatible = (
+        video_stream.get("codec_name") in ("h264", "avc1")
+        and audio_stream.get("codec_name") == "aac"
+        and os.path.splitext(video_path)[1].lower() == ".mp4"
+        and os.path.splitext(audio_path)[1].lower() in (".mp4", ".m4a")
+    )
+    extension = "mp4" if compatible else "mkv"
+    output_path = os.path.join(output_dir, f"{base_name}.{extension}")
+    inputs = [video_path, audio_path]
+    base_cmd = [FFMPEG_BIN, "-y", "-i", inputs[0], "-i", inputs[1],
+                "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", output_path]
+    display_parts = ", ".join(os.path.basename(p) for p in parts)
+    for attempt in range(2):
+        cmd = base_cmd if attempt == 0 else [FFMPEG_BIN, "-y", "-err_detect", "ignore_err",
+                                             "-i", inputs[0], "-err_detect", "ignore_err",
+                                             "-i", inputs[1], "-map", "0:v:0", "-map", "1:a:0",
+                                             "-c", "copy", output_path]
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+                for path in parts:
+                    try:
+                        os.remove(path)
+                    except OSError as error:
+                        log(channel_name, f"Merged output saved, but could not remove {os.path.basename(path)}: {error}")
+                log(channel_name, f"Recording saved: {output_path} (merged {display_parts})")
+                return output_path
+        except (OSError, subprocess.SubprocessError) as error:
+            log(channel_name, f"Merge attempt {attempt + 1} failed for {display_parts}: {error}")
+    log(channel_name, f"Could not merge parts {display_parts}; all part files were kept")
+    return False
+
+
+def recover_recordings(output_dir):
+    """Merge old split recordings and remove only old, empty part files."""
+    if not os.path.isdir(output_dir):
+        log("server", f"Startup recovery skipped; output directory not found: {output_dir}")
+        return
+    now = time.time()
+    prefix_pattern = re.compile(r"^(.*)\.f\d+\.[^.]+$")
+    groups = {}
+    for name in sorted(os.listdir(output_dir)):
+        match = prefix_pattern.fullmatch(name)
+        if not match:
+            continue
+        path = os.path.join(output_dir, name)
+        if os.path.isfile(path):
+            groups.setdefault(match.group(1), []).append(path)
+
+    for base_name, paths in sorted(groups.items()):
+        if not any(os.path.getsize(path) > 0 for path in paths):
+            continue
+        if base_name in set(active_prefixes()):
+            log("server", f"Startup recovery skipped active recording {base_name}")
+            continue
+        if any(now - os.path.getmtime(path) <= 5 * 60 for path in paths):
+            log("server", f"Startup recovery skipped recent part files for {base_name}")
+            continue
+        result = finalize_recording_output(output_dir, base_name, "server")
+        if result is False or result is None:
+            log("server", f"Startup recovery could not finalize {base_name}")
+        else:
+            log("server", f"Startup recovery finalized {base_name}: {os.path.basename(result)}")
+
+    for name in sorted(os.listdir(output_dir)):
+        if not prefix_pattern.fullmatch(name):
+            continue
+        path = os.path.join(output_dir, name)
+        if not os.path.isfile(path) or os.path.getsize(path) != 0:
+            continue
+        base_name = prefix_pattern.fullmatch(name).group(1)
+        if base_name in set(active_prefixes()):
+            continue
+        try:
+            if now - os.path.getmtime(path) > 10 * 60:
+                os.remove(path)
+                log("server", f"Startup recovery removed old empty part file {name}")
+        except OSError as error:
+            log("server", f"Startup recovery could not remove {name}: {error}")
 
 
 def cleanup_empty_recording_files(output_dir, base_name):
@@ -527,6 +664,9 @@ def main():
     })
 
     threads = [spawn_channel_thread(c) for c in channels]
+    recovery = threading.Thread(target=recover_recordings,
+                                args=(GLOBALS["output_dir"],), daemon=True)
+    recovery.start()
     for t in threads:
         t.join()
     while True:

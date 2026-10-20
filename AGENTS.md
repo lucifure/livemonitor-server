@@ -33,6 +33,7 @@ The responses of api_server.py today are the contract. The app uses at least:
 
 ## Behaviour rules
 Stop interrupts any running recording gracefully and saves what was recorded.
+Video and audio parts are merged after every recording, and a part is never deleted unless the merge succeeded.
 1. Errors never change a channel's status. Only an explicit user action through the API (stop/pause) sets `paused`. A failed check, proxy error, HTTP error or unexpected page is logged, stored in last_error, and retried on the next poll. last_error is cleared on the next success. On HTTP 429 or consent/bot-check pages back off up to 5 minutes but keep retrying.
 2. "Cannot tell" is not "not live". If the page has no player data or looks like a consent/bot-check page, log "unexpected page" and set last_error. Never fail silently.
 3. A channel the user paused stays paused after a restart. Everything else starts as idle.
