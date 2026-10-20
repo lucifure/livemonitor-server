@@ -5,6 +5,8 @@ from datetime import datetime
 
 import api_server
 
+log_level = api_server.log_level
+
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(PROJECT_DIR, "config.json")
 # deploy/setup.sh installs yt-dlp into this venv and ffmpeg with apt.  Keep
@@ -14,7 +16,8 @@ YTDLP_BIN = (os.path.join(PROJECT_DIR, ".venv", "bin", "yt-dlp")
              else (shutil.which("yt-dlp") or os.path.expanduser("~/.local/bin/yt-dlp")))
 FFMPEG_BIN = "/usr/bin/ffmpeg" if os.path.isfile("/usr/bin/ffmpeg") else (shutil.which("ffmpeg") or "ffmpeg")
 FFPROBE_BIN = "/usr/bin/ffprobe" if os.path.isfile("/usr/bin/ffprobe") else (shutil.which("ffprobe") or "ffprobe")
-LOG_BUFFER = deque(maxlen=500)
+LOG_BUFFER = deque(maxlen=2000)
+LOG_LOCK = threading.Lock()
 STATE = {}
 STATE_LOCK = threading.Lock()
 CONFIG_LOCK = threading.Lock()
@@ -53,8 +56,22 @@ def save_channels_to_config(channels_list):
 def log(channel_name, message):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] [{channel_name}] {message}"
-    LOG_BUFFER.append(line)
+    with LOG_LOCK:
+        LOG_BUFFER.append(line)
     print(line, flush=True)
+
+
+def get_logs(limit):
+    with LOG_LOCK:
+        return list(LOG_BUFFER)[-limit:]
+
+
+def clear_logs():
+    with LOG_LOCK:
+        removed = len(LOG_BUFFER)
+        LOG_BUFFER.clear()
+        LOG_BUFFER.append("Server log cleared from the app.")
+        return removed
 
 
 def set_state(name, **kwargs):
@@ -654,7 +671,8 @@ def main():
 
     api_server.start_api(config, {
         "status": get_status,
-        "logs": lambda n: list(LOG_BUFFER)[-n:],
+        "logs": get_logs,
+        "clear_logs": clear_logs,
         "active_prefixes": active_prefixes,
         "log": lambda msg: log("api", msg),
         "add_channel": add_channel,

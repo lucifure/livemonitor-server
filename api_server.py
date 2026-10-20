@@ -6,6 +6,18 @@ VALID_QUALITIES = ("360p", "480p", "720p", "1080p", "best")
 CHANNEL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
+def log_level(line):
+    text = str(line).lower()
+    if any(term in text for term in ("error", "failed", "could not", "exited with code", "no output file", "traceback")):
+        return "ERROR"
+    if any(term in text for term in ("waiting", "backoff", "skipped", "only a video part",
+                                    "only an audio part", "low disk", "under 120s")):
+        return "WARNING"
+    if any(term in text for term in ("recording saved", "finalized", "merged")):
+        return "SUCCESS"
+    return "INFO"
+
+
 def start_api(config, ctx):
     token = config.get("api_token", "")
     if not token or token == "CHANGE_ME":
@@ -83,13 +95,19 @@ def start_api(config, ctx):
                 return self.send_json(200, {"channels": ctx["status"]()["channels"]})
             if path == "/logs":
                 qs = parse_qs(parsed.query)
-                raw_n = qs.get("limit", qs.get("n", ["100"]))[0]
+                raw_n = qs.get("limit", qs.get("n", ["200"]))[0]
                 try:
                     n = int(raw_n)
                 except ValueError:
-                    n = 100
-                n = max(1, min(n, 500))
-                return self.send_json(200, {"lines": ctx["logs"](n)})
+                    n = 200
+                n = max(1, min(n, 2000))
+                lines = ctx["logs"](n)
+                offset = time.localtime().tm_gmtoff
+                return self.send_json(200, {
+                    "lines": lines,
+                    "levels": [log_level(line) for line in lines],
+                    "utc_offset_seconds": offset,
+                })
             if path == "/recordings":
                 items = []
                 if os.path.isdir(output_dir):
@@ -201,6 +219,8 @@ def start_api(config, ctx):
             if not self.authorized():
                 return self.send_json(401, {"error": "unauthorized"})
             path = urlparse(self.path).path
+            if path == "/logs":
+                return self.send_json(200, {"cleared": ctx["clear_logs"]()})
             if path.startswith("/recordings/"):
                 name, fpath = safe_path(path[len("/recordings/"):])
                 if not name:

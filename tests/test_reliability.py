@@ -131,6 +131,44 @@ def test_status_uses_empty_strings_and_includes_version():
     assert {k: status["channels"][0][k] for k in ("title", "last_error", "video_id")} == {"title": "", "last_error": "", "video_id": ""}
 
 
+@pytest.mark.parametrize(("line", "expected"), [
+    ("An ERROR occurred", "ERROR"),
+    ("yt-dlp failed", "ERROR"),
+    ("Could not merge the files", "ERROR"),
+    ("Process exited with code 1", "ERROR"),
+    ("No output file found", "ERROR"),
+    ("Traceback from worker", "ERROR"),
+    ("Waiting 30 seconds", "WARNING"),
+    ("Backoff active", "WARNING"),
+    ("Startup recovery skipped recent parts", "WARNING"),
+    ("only a video part was found", "WARNING"),
+    ("only an audio part was found", "WARNING"),
+    ("low disk space", "WARNING"),
+    ("recording ended under 120s", "WARNING"),
+    ("Recording saved to show.mp4", "SUCCESS"),
+    ("finalized old recording", "SUCCESS"),
+    ("merged video and audio", "SUCCESS"),
+    ("channel check started", "INFO"),
+    ("ERROR and waiting for retry", "ERROR"),
+    ("waiting; recording saved", "WARNING"),
+])
+def test_log_level_classification_and_priority(line, expected):
+    assert server.log_level(line) == expected
+
+
+def test_log_buffer_retains_2000_plain_string_lines():
+    server.LOG_BUFFER.extend(f"entry {index}" for index in range(2005))
+    assert len(server.LOG_BUFFER) == 2000
+    assert server.LOG_BUFFER[0] == "entry 5"
+    assert server.LOG_BUFFER[-1] == "entry 2004"
+
+
+def test_clear_logs_leaves_only_the_clear_message():
+    server.LOG_BUFFER.extend(("old one", "old two", "old three"))
+    assert server.clear_logs() == 3
+    assert list(server.LOG_BUFFER) == ["Server log cleared from the app."]
+
+
 def test_server_version_has_safe_fallback(monkeypatch):
     monkeypatch.setattr(server.subprocess, "check_output", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("no git")))
     assert server.server_version() == "unknown"

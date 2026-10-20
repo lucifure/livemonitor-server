@@ -30,6 +30,7 @@ The responses of api_server.py today are the contract. The app uses at least:
 | POST /channels/<name>/resume, /stop (and /start if it exists today) | keep current behaviour |
 | DELETE /channels/<name> | removes the channel, keeps recordings |
 | GET /logs?limit=N | {lines:[...]} |
+GET /logs also returns `levels` and `utc_offset_seconds`; DELETE /logs clears the app log and returns the number of removed lines.
 
 ## Behaviour rules
 Stop interrupts any running recording gracefully and saves what was recorded.

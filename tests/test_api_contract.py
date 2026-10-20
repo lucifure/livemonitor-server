@@ -4,16 +4,24 @@ import json
 import os
 import threading
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import api_server
 
 
 @contextmanager
-def api(tmp_path, status=None, active=(), pause_callback=None):
+def api(tmp_path, status=None, active=(), pause_callback=None, log_lines=None):
     calls = []
+    stored_logs = ["one", "two"] if log_lines is None else log_lines
+    def clear_logs():
+        removed = len(stored_logs)
+        stored_logs.clear()
+        stored_logs.append("Server log cleared from the app.")
+        return removed
     ctx = {
         "status": lambda: status or {"server_time": 1, "started_at": 1, "channels": [{"name": "alpha", "url": "https://www.youtube.com/@alpha", "quality": "480p", "status": "idle", "title": "", "last_error": "", "video_id": ""}]},
-        "logs": lambda n: ["one", "two"][-n:],
+        "logs": lambda n: stored_logs[-n:],
+        "clear_logs": clear_logs,
         "active_prefixes": lambda: list(active),
         "log": calls.append,
         "add_channel": lambda n, u, q: (True, None),
@@ -31,7 +39,7 @@ def api(tmp_path, status=None, active=(), pause_callback=None):
 
 def request(server, method, path, body=None, token="test-token"):
     conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
-    headers = {"Authorization": "Bearer " + token}
+    headers = {} if token is None else {"Authorization": "Bearer " + token}
     if body is not None:
         headers["Content-Type"] = "application/json"
     conn.request(method, path, body=json.dumps(body) if body is not None else None, headers=headers)
@@ -56,7 +64,10 @@ def test_existing_api_response_shapes_and_status_codes(tmp_path):
         assert {"name", "size", "modified", "in_progress"} == json.loads(data)["recordings"][0].keys()
 
         status, _, data = request(server, "GET", "/logs?limit=1")
-        assert status == 200 and json.loads(data) == {"lines": ["two"]}
+        decoded_logs = json.loads(data)
+        assert status == 200 and decoded_logs["lines"] == ["two"]
+        assert decoded_logs["levels"] == ["INFO"]
+        assert isinstance(decoded_logs["utc_offset_seconds"], int)
         status, _, data = request(server, "POST", "/channels", {"name": "new", "url": "https://www.youtube.com/@new", "quality": "480p"})
         assert (status, json.loads(data)) == (201, {"added": "new"})
         status, _, data = request(server, "POST", "/channels/alpha/stop")
@@ -109,3 +120,42 @@ def test_api_rejects_invalid_names_urls_and_file_escapes(tmp_path):
         for path in ("/recordings/../outside.mp4", "/recordings/link.mp4"):
             status, _, data = request(server, "GET", path)
             assert (status, json.loads(data)) == (404, {"error": "not found"})
+
+
+def test_logs_response_includes_matching_levels_and_local_utc_offset(tmp_path, monkeypatch):
+    import api_server as module
+    monkeypatch.setattr(module.time, "localtime", lambda: SimpleNamespace(tm_gmtoff=19800))
+    lines = ["recording saved: x.mp4", "Waiting 30s before retry", "ERROR: recording saved"]
+    with api(tmp_path, log_lines=lines) as (server, _):
+        status, _, payload = request(server, "GET", "/logs?limit=3")
+        decoded = json.loads(payload)
+        assert status == 200
+        assert decoded["lines"] == lines
+        assert decoded["levels"] == ["SUCCESS", "WARNING", "ERROR"]
+        assert decoded["utc_offset_seconds"] == 19800
+        assert len(decoded["lines"]) == len(decoded["levels"])
+
+
+def test_logs_limit_is_capped_at_2000(tmp_path):
+    lines = [f"line {index}" for index in range(2200)]
+    with api(tmp_path, log_lines=lines) as (server, _):
+        status, _, payload = request(server, "GET", "/logs?limit=9000")
+        decoded = json.loads(payload)
+        assert status == 200
+        assert len(decoded["lines"]) == 2000
+        assert decoded["lines"][0] == "line 200"
+        assert len(decoded["levels"]) == 2000
+
+
+def test_delete_logs_requires_token_and_clears_buffer(tmp_path):
+    lines = ["first", "second", "third"]
+    with api(tmp_path, log_lines=lines) as (server, _):
+        status, _, payload = request(server, "DELETE", "/logs", token=None)
+        assert (status, json.loads(payload)) == (401, {"error": "unauthorized"})
+        assert len(lines) == 3
+        status, _, payload = request(server, "DELETE", "/logs")
+        assert (status, json.loads(payload)) == (200, {"cleared": 3})
+        assert lines == ["Server log cleared from the app."]
+        status, _, payload = request(server, "GET", "/logs")
+        assert status == 200
+        assert json.loads(payload)["lines"] == ["Server log cleared from the app."]
