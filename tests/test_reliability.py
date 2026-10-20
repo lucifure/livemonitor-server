@@ -119,6 +119,7 @@ def test_monitor_rechecks_and_starts_a_new_recording_after_one_ends(monkeypatch)
     starts = []
     def record(*args):
         starts.append(args)
+        server.set_state("a", last_recording_duration_seconds=120)
         if len(starts) == 2:
             server.CONTROL["a"]["remove"].set()
         return True
@@ -128,6 +129,105 @@ def test_monitor_rechecks_and_starts_a_new_recording_after_one_ends(monkeypatch)
     server.monitor_channel(channel)
     assert len(starts) == 2
     assert len(delays) >= 5  # five one-second sleeps make the restart delay responsive to stop.
+
+
+def test_monitor_failure_backoff_grows_and_caps(monkeypatch):
+    channel = {"name": "a", "url": "https://youtube.com/@a", "quality": "480p"}
+    server.GLOBALS.update(proxy="", output_dir="/tmp", poll_interval=1)
+    server.CONTROL["a"] = {"pause": threading.Event(), "remove": threading.Event()}
+    monkeypatch.setattr(server, "check_live", lambda *args: {"video_id": "abc", "title": "show"})
+    attempts = []
+    def failed(*args):
+        attempts.append(1)
+        if len(attempts) == 8:
+            server.CONTROL["a"]["remove"].set()
+        server.set_state("a", last_recording_duration_seconds=3)
+        return False
+    monkeypatch.setattr(server, "record_stream", failed)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+    messages = []
+    monkeypatch.setattr(server, "log", lambda name, message: messages.append(message))
+    server.monitor_channel(channel)
+    waits = [int(line.split("waiting ")[1].split("s")[0]) for line in messages if "attempt failed" in line]
+    assert waits == [30, 60, 120, 240, 300, 300, 300, 300]
+    assert not any("paused" in line for line in messages)
+
+
+def test_long_success_resets_failure_backoff(monkeypatch):
+    channel = {"name": "a", "url": "https://youtube.com/@a", "quality": "480p"}
+    server.GLOBALS.update(proxy="", output_dir="/tmp", poll_interval=1)
+    server.CONTROL["a"] = {"pause": threading.Event(), "remove": threading.Event()}
+    monkeypatch.setattr(server, "check_live", lambda *args: {"video_id": "abc", "title": "show"})
+    attempts = []
+    def record(*args):
+        attempts.append(True)
+        if len(attempts) == 4:
+            server.CONTROL["a"]["remove"].set()
+        server.set_state("a", last_recording_duration_seconds=130 if len(attempts) == 3 else 3)
+        return len(attempts) == 3
+    monkeypatch.setattr(server, "record_stream", record)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: None)
+    messages = []
+    monkeypatch.setattr(server, "log", lambda name, message: messages.append(message))
+    server.monitor_channel(channel)
+    waits = [int(line.split("waiting ")[1].split("s")[0]) for line in messages if "attempt failed" in line]
+    assert waits == [30, 60, 30]
+
+
+def test_empty_recording_leftovers_only_are_removed(tmp_path):
+    (tmp_path / "base.f135.mp4").write_bytes(b"")
+    (tmp_path / "base.f140.mp4").write_bytes(b"audio")
+    (tmp_path / "other.f135.mp4").write_bytes(b"")
+    server.cleanup_empty_recording_files(str(tmp_path), "base")
+    assert not (tmp_path / "base.f135.mp4").exists()
+    assert (tmp_path / "base.f140.mp4").read_bytes() == b"audio"
+    assert (tmp_path / "other.f135.mp4").exists()
+
+
+def test_ffmpeg_failure_keeps_ts_and_reports_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(server.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**12))
+    monkeypatch.setattr(server, "sanitize_filename", lambda title: "base")
+    monkeypatch.setattr(server, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "01012026" if "%d" in fmt else "00-00-00")))
+    monkeypatch.setattr(server.subprocess, "run", lambda cmd, **kwargs: (
+        SimpleNamespace(returncode=0, stdout="") if "-i" not in cmd else SimpleNamespace(returncode=1, stdout="")
+    ))
+    ts = tmp_path / "base_01012026_00-00-00.ts"
+    def listdir(path):
+        if not ts.exists():
+            ts.write_bytes(b"video")
+        return [ts.name]
+    monkeypatch.setattr(server.os, "listdir", listdir)
+    assert server.record_stream("a", "abc", "show", "", str(tmp_path), "480p") is False
+    assert ts.read_bytes() == b"video"
+    assert "keeping original .ts" in server.STATE["a"]["last_error"]
+
+
+def test_ytdlp_command_omits_certificate_bypass(tmp_path, monkeypatch):
+    monkeypatch.setattr(server.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**12))
+    monkeypatch.setattr(server, "sanitize_filename", lambda title: "base")
+    monkeypatch.setattr(server, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "01012026" if "%d" in fmt else "00-00-00")))
+    commands = []
+    monkeypatch.setattr(server.subprocess, "run", lambda cmd, **kwargs: (commands.append(cmd) or SimpleNamespace(returncode=1, stdout="failed")))
+    monkeypatch.setattr(server.os, "listdir", lambda p: [])
+    assert server.record_stream("a", "abc", "show", "", str(tmp_path), "480p") is False
+    assert "--no-check-certificates" not in commands[0]
+
+
+def test_change_me_disables_api(capsys, tmp_path):
+    assert server.api_server.start_api({"api_token": "CHANGE_ME", "output_dir": str(tmp_path)}, {}) is None
+    assert "API disabled" in capsys.readouterr().out
+
+
+def test_missing_proxy_config_defaults_to_direct(monkeypatch, tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"channels": [], "api_token": "", "min_free_gb": 4}))
+    monkeypatch.setattr(server, "CONFIG_PATH", str(config))
+    monkeypatch.setattr(server, "server_version", lambda: "deadbee")
+    monkeypatch.setattr(server.api_server, "start_api", lambda *args: None)
+    monkeypatch.setattr(server.time, "sleep", lambda _: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        server.main()
+    assert server.GLOBALS["proxy"] == ""
 
 
 def test_main_logs_version_before_starting_workers(monkeypatch, tmp_path):

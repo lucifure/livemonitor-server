@@ -8,8 +8,8 @@ CHANNEL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 def start_api(config, ctx):
     token = config.get("api_token", "")
-    if not token:
-        print("API disabled: no api_token in config.json", flush=True)
+    if not token or token == "CHANGE_ME":
+        print("API disabled: api_token is empty or still set to CHANGE_ME in config.json", flush=True)
         return None
     output_dir = config.get("output_dir", os.path.expanduser("~/recordings"))
     bind = config.get("api_bind", "127.0.0.1")

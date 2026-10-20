@@ -210,7 +210,7 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
     video_url = f"https://youtube.com/watch?v={video_id}"
 
     cmd = [
-        YTDLP_BIN, "--force-ipv4", "--no-check-certificates", "--no-update",
+        YTDLP_BIN, "--force-ipv4", "--no-update",
         "-f", format_selector(quality),
         "--hls-use-mpegts", "--hls-prefer-native",
         "--skip-unavailable-fragments", "--fragment-retries", "3",
@@ -224,16 +224,23 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         cmd[1:1] = ["--proxy", proxy]
 
     set_state(channel_name, status="recording", video_id=video_id, title=title,
-              recording_started_at=int(time.time()), base_name=base_name)
+              recording_started_at=int(time.time()), base_name=base_name,
+              last_recording_duration_seconds=0)
+    started = time.monotonic()
+    succeeded = False
     try:
         log(channel_name, f"Recording started: {video_url} -> {output_template}")
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, errors="replace")
+        duration = max(0, int(time.monotonic() - started))
+        set_state(channel_name, last_recording_duration_seconds=duration)
         log(channel_name, f"yt-dlp exited with code {result.returncode}")
         if result.returncode:
             tail = "\n".join((result.stdout or "").splitlines()[-10:])
             log(channel_name, f"yt-dlp failed; output tail: {tail or '(no output)'}")
             set_state(channel_name, last_error=f"yt-dlp exited with code {result.returncode}")
+            cleanup_empty_recording_files(output_dir, base_name)
+            return False
 
         set_state(channel_name, status="finalizing")
         produced = None
@@ -251,15 +258,49 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         if produced.endswith(".ts"):
             mp4_path = produced[:-3] + "mp4"
             log(channel_name, f"Converting .ts to mp4: {mp4_path}")
-            subprocess.run([FFMPEG_BIN, "-y", "-i", produced, "-c", "copy", mp4_path])
-            os.remove(produced)
+            try:
+                conversion = subprocess.run([FFMPEG_BIN, "-y", "-i", produced, "-c", "copy", mp4_path])
+                if conversion.returncode != 0 or not os.path.isfile(mp4_path) or os.path.getsize(mp4_path) == 0:
+                    message = "ffmpeg conversion failed; keeping original .ts recording"
+                    log(channel_name, message)
+                    set_state(channel_name, last_error=message)
+                    cleanup_empty_recording_files(output_dir, base_name)
+                    return False
+                os.remove(produced)
+            except OSError as error:
+                message = f"ffmpeg conversion failed; keeping original .ts recording: {error}"
+                log(channel_name, message)
+                set_state(channel_name, last_error=message)
+                cleanup_empty_recording_files(output_dir, base_name)
+                return False
             log(channel_name, f"Recording saved: {mp4_path}")
         else:
             log(channel_name, f"Recording saved (native container, no remux needed): {produced}")
+        if duration < 120:
+            message = f"recording ended after {duration}s (under 120s)"
+            log(channel_name, message)
+            set_state(channel_name, last_error=message)
+            cleanup_empty_recording_files(output_dir, base_name)
+        succeeded = True
         return True
     finally:
+        if not succeeded:
+            cleanup_empty_recording_files(output_dir, base_name)
         set_state(channel_name, status="idle", video_id=None, title=None,
                   recording_started_at=None, base_name=None)
+
+
+def cleanup_empty_recording_files(output_dir, base_name):
+    """Remove only empty leftovers from this yt-dlp output name."""
+    try:
+        for fname in os.listdir(output_dir):
+            if fname.startswith(base_name + "."):
+                path = os.path.join(output_dir, fname)
+                if os.path.isfile(path) and os.path.getsize(path) == 0:
+                    os.remove(path)
+                    log("server", f"Removed empty recording leftover: {fname}")
+    except OSError as error:
+        log("server", f"Could not clean empty recording leftovers for {base_name}: {error}")
 
 
 def monitor_channel(channel):
@@ -269,6 +310,7 @@ def monitor_channel(channel):
     output_dir = GLOBALS["output_dir"]
     poll_interval = GLOBALS["poll_interval"]
     ctrl = CONTROL[name]
+    consecutive_failures = 0
 
     set_state(name, url=url, quality=quality, status="paused" if ctrl["pause"].is_set() else "idle", video_id=None, title=None,
               recording_started_at=None, last_check=None, last_error=None, base_name=None)
@@ -283,19 +325,27 @@ def monitor_channel(channel):
             set_state(name, status="paused")
             time.sleep(min(poll_interval, 5))
             continue
-        just_recorded = False
+        delay = poll_interval
         try:
             live_info = check_live(url, proxy, name)
             set_state(name, last_check=int(time.time()))
             if live_info:
                 log(name, f"LIVE detected: {live_info['title']} ({live_info['video_id']})")
-                record_stream(name, live_info["video_id"], live_info["title"], proxy, output_dir, quality)
-                just_recorded = True
+                result = record_stream(name, live_info["video_id"], live_info["title"], proxy, output_dir, quality)
+                duration = STATE.get(name, {}).get("last_recording_duration_seconds", 0)
+                if not result or duration < 120:
+                    consecutive_failures += 1
+                    delay = min(30 * (2 ** (consecutive_failures - 1)), 300)
+                    log(name, f"attempt failed ({consecutive_failures} in a row); waiting {delay}s before checking again")
+                else:
+                    consecutive_failures = 0
+                    delay = 5
         except Exception as e:
             log(name, f"monitor loop error: {e}")
             set_state(name, last_error=f"monitor loop error: {e}")
-        with STATE_LOCK:
-            delay = 5 if just_recorded else (STATE.get(name, {}).get("backoff_seconds", 0) or poll_interval)
+        if delay == poll_interval:
+            with STATE_LOCK:
+                delay = STATE.get(name, {}).get("backoff_seconds", 0) or poll_interval
         for _ in range(delay):
             if ctrl["remove"].is_set() or ctrl["pause"].is_set():
                 break
@@ -374,7 +424,7 @@ def _set_channel_paused_in_config(name, paused):
 
 def main():
     config = load_config()
-    GLOBALS["proxy"] = config.get("proxy", "http://127.0.0.1:1080")
+    GLOBALS["proxy"] = config.get("proxy", "")
     GLOBALS["output_dir"] = config.get("output_dir", os.path.expanduser("~/recordings"))
     GLOBALS["poll_interval"] = int(config.get("poll_interval_seconds", 60))
     GLOBALS["min_free_gb"] = config.get("min_free_gb", 3)
