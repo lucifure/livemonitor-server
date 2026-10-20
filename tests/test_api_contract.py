@@ -9,7 +9,7 @@ import api_server
 
 
 @contextmanager
-def api(tmp_path, status=None, active=()):
+def api(tmp_path, status=None, active=(), pause_callback=None):
     calls = []
     ctx = {
         "status": lambda: status or {"server_time": 1, "started_at": 1, "channels": [{"name": "alpha", "url": "https://www.youtube.com/@alpha", "quality": "480p", "status": "idle", "title": "", "last_error": "", "video_id": ""}]},
@@ -18,7 +18,7 @@ def api(tmp_path, status=None, active=()):
         "log": calls.append,
         "add_channel": lambda n, u, q: (True, None),
         "remove_channel": lambda n: (True, None),
-        "pause_channel": lambda n: n == "alpha",
+        "pause_channel": pause_callback or (lambda n: n == "alpha"),
         "resume_channel": lambda n: n == "alpha",
     }
     server = api_server.start_api({"api_token": "test-token", "output_dir": str(tmp_path), "api_bind": "127.0.0.1", "api_port": 0}, ctx)
@@ -74,6 +74,25 @@ def test_auth_and_recording_status_codes(tmp_path):
         assert (status, json.loads(data)) == (409, {"error": "recording in progress"})
         status, _, data = request(server, "DELETE", "/recordings/missing.mp4")
         assert (status, json.loads(data)) == (404, {"error": "not found"})
+
+
+def test_stop_api_returns_while_recording_worker_is_still_running(tmp_path):
+    release = threading.Event()
+    stop_requested = threading.Event()
+    worker = threading.Thread(target=release.wait)
+    worker.start()
+    def request_stop(name):
+        stop_requested.set()
+        return name == "alpha"
+    try:
+        with api(tmp_path, pause_callback=request_stop) as (server, _):
+            status, _, payload = request(server, "POST", "/channels/alpha/stop")
+            assert (status, json.loads(payload)) == (200, {"channel": "alpha", "action": "stop"})
+            assert stop_requested.is_set()
+            assert worker.is_alive()
+    finally:
+        release.set()
+        worker.join(timeout=1)
 
 
 def test_api_rejects_invalid_names_urls_and_file_escapes(tmp_path):

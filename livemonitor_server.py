@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, re, shutil, subprocess, threading, time
+import json, os, re, shutil, signal, subprocess, threading, time
 from collections import deque
 from datetime import datetime
 
@@ -18,6 +18,8 @@ STATE = {}
 STATE_LOCK = threading.Lock()
 CONFIG_LOCK = threading.Lock()
 CONTROL = {}
+STOP_GRACE_SECONDS = 120
+STOP_TERM_SECONDS = 15
 STARTED_AT = int(time.time())
 GLOBALS = {}
 
@@ -223,22 +225,68 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
     if proxy:
         cmd[1:1] = ["--proxy", proxy]
 
+    ctrl = CONTROL.get(channel_name, {})
+    stop_now = ctrl.setdefault("stop_now", threading.Event())
+    stop_now.clear()
+    if ctrl.get("pause") and ctrl["pause"].is_set():
+        set_state(channel_name, status="paused")
+        return True
     set_state(channel_name, status="recording", video_id=video_id, title=title,
               recording_started_at=int(time.time()), base_name=base_name,
               last_recording_duration_seconds=0)
     started = time.monotonic()
     succeeded = False
+    stopped_by_user = False
     try:
         log(channel_name, f"Recording started: {video_url} -> {output_template}")
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, errors="replace")
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, errors="replace", bufsize=1,
+                                   start_new_session=True)
+        output_lines = deque(maxlen=200)
+
+        reader = threading.Thread(target=read_process_output,
+                                  args=(process.stdout, output_lines), daemon=True)
+        reader.start()
+        while process.poll() is None:
+            if stop_now and stop_now.is_set():
+                stopped_by_user = True
+                set_state(channel_name, status="finalizing")
+                log(channel_name, "Stop requested; asking yt-dlp to finish and save")
+                try:
+                    os.killpg(process.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=STOP_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    log(channel_name, "yt-dlp did not finish after SIGINT; sending SIGTERM")
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=STOP_TERM_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        log(channel_name, "yt-dlp did not finish after SIGTERM; sending SIGKILL")
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait()
+                break
+            time.sleep(1)
+        return_code = process.wait()
+        reader.join(timeout=2)
+        if stop_now.is_set():
+            stopped_by_user = True
+            set_state(channel_name, status="finalizing")
         duration = max(0, int(time.monotonic() - started))
         set_state(channel_name, last_recording_duration_seconds=duration)
-        log(channel_name, f"yt-dlp exited with code {result.returncode}")
-        if result.returncode:
-            tail = "\n".join((result.stdout or "").splitlines()[-10:])
+        log(channel_name, f"yt-dlp exited with code {return_code}")
+        if return_code and not stopped_by_user:
+            tail = "\n".join(list(output_lines)[-10:])
             log(channel_name, f"yt-dlp failed; output tail: {tail or '(no output)'}")
-            set_state(channel_name, last_error=f"yt-dlp exited with code {result.returncode}")
+            set_state(channel_name, last_error=f"yt-dlp exited with code {return_code}")
             cleanup_empty_recording_files(output_dir, base_name)
             return False
 
@@ -246,37 +294,52 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         produced = None
         for fname in os.listdir(output_dir):
             if fname.startswith(base_name + "."):
-                produced = os.path.join(output_dir, fname)
-                break
+                candidate = os.path.join(output_dir, fname)
+                if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                    produced = candidate
+                    break
 
         if not produced:
-            tail = "\n".join((result.stdout or "").splitlines()[-10:])
+            if stopped_by_user:
+                log(channel_name, "Stop requested; nothing was recorded")
+                cleanup_empty_recording_files(output_dir, base_name)
+                succeeded = True
+                return True
+            tail = "\n".join(list(output_lines)[-10:])
             log(channel_name, f"No output file found; yt-dlp output tail: {tail or '(no output)'}")
             set_state(channel_name, last_error="yt-dlp produced no output file")
             return False
 
         if produced.endswith(".ts"):
-            mp4_path = produced[:-3] + "mp4"
+            mp4_path = produced[:-2] + "mp4"
             log(channel_name, f"Converting .ts to mp4: {mp4_path}")
             try:
                 conversion = subprocess.run([FFMPEG_BIN, "-y", "-i", produced, "-c", "copy", mp4_path])
                 if conversion.returncode != 0 or not os.path.isfile(mp4_path) or os.path.getsize(mp4_path) == 0:
                     message = "ffmpeg conversion failed; keeping original .ts recording"
                     log(channel_name, message)
-                    set_state(channel_name, last_error=message)
+                    if not stopped_by_user:
+                        set_state(channel_name, last_error=message)
                     cleanup_empty_recording_files(output_dir, base_name)
+                    if stopped_by_user:
+                        succeeded = True
+                        return True
                     return False
                 os.remove(produced)
             except OSError as error:
                 message = f"ffmpeg conversion failed; keeping original .ts recording: {error}"
                 log(channel_name, message)
-                set_state(channel_name, last_error=message)
+                if not stopped_by_user:
+                    set_state(channel_name, last_error=message)
                 cleanup_empty_recording_files(output_dir, base_name)
+                if stopped_by_user:
+                    succeeded = True
+                    return True
                 return False
             log(channel_name, f"Recording saved: {mp4_path}")
         else:
             log(channel_name, f"Recording saved (native container, no remux needed): {produced}")
-        if duration < 120:
+        if duration < 120 and not stopped_by_user:
             message = f"recording ended after {duration}s (under 120s)"
             log(channel_name, message)
             set_state(channel_name, last_error=message)
@@ -286,7 +349,8 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
     finally:
         if not succeeded:
             cleanup_empty_recording_files(output_dir, base_name)
-        set_state(channel_name, status="idle", video_id=None, title=None,
+        final_status = "paused" if stopped_by_user or (ctrl.get("pause") and ctrl["pause"].is_set()) else "idle"
+        set_state(channel_name, status=final_status, video_id=None, title=None,
                   recording_started_at=None, base_name=None)
 
 
@@ -301,6 +365,15 @@ def cleanup_empty_recording_files(output_dir, base_name):
                     log("server", f"Removed empty recording leftover: {fname}")
     except OSError as error:
         log("server", f"Could not clean empty recording leftovers for {base_name}: {error}")
+
+
+def read_process_output(stream, output_lines):
+    """Drain subprocess output continuously while retaining only its last 200 lines."""
+    try:
+        for line in stream:
+            output_lines.append(line.rstrip("\r\n"))
+    except (OSError, ValueError):
+        pass
 
 
 def monitor_channel(channel):
@@ -330,16 +403,23 @@ def monitor_channel(channel):
             live_info = check_live(url, proxy, name)
             set_state(name, last_check=int(time.time()))
             if live_info:
+                if ctrl["pause"].is_set():
+                    set_state(name, status="paused")
+                    continue
                 log(name, f"LIVE detected: {live_info['title']} ({live_info['video_id']})")
                 result = record_stream(name, live_info["video_id"], live_info["title"], proxy, output_dir, quality)
                 duration = STATE.get(name, {}).get("last_recording_duration_seconds", 0)
-                if not result or duration < 120:
+                if ctrl["pause"].is_set():
+                    set_state(name, status="paused")
+                elif not result or duration < 120:
                     consecutive_failures += 1
                     delay = min(30 * (2 ** (consecutive_failures - 1)), 300)
                     log(name, f"attempt failed ({consecutive_failures} in a row); waiting {delay}s before checking again")
                 else:
                     consecutive_failures = 0
                     delay = 5
+            elif STATE.get(name, {}).get("last_error") is None:
+                consecutive_failures = 0
         except Exception as e:
             log(name, f"monitor loop error: {e}")
             set_state(name, last_error=f"monitor loop error: {e}")
@@ -354,7 +434,7 @@ def monitor_channel(channel):
 
 def spawn_channel_thread(channel):
     name = channel["name"]
-    CONTROL[name] = {"pause": threading.Event(), "remove": threading.Event()}
+    CONTROL[name] = {"pause": threading.Event(), "remove": threading.Event(), "stop_now": threading.Event()}
     if channel.get("paused"):
         CONTROL[name]["pause"].set()
     t = threading.Thread(target=monitor_channel, args=(channel,), daemon=True)
@@ -398,6 +478,7 @@ def pause_channel(name):
     if name not in CONTROL:
         return False
     CONTROL[name]["pause"].set()
+    CONTROL[name].setdefault("stop_now", threading.Event()).set()
     _set_channel_paused_in_config(name, True)
     log(name, "Paused via API")
     return True
