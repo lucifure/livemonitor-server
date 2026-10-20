@@ -43,6 +43,9 @@ cd /home/ubuntu/livemonitor-server
 bash deploy/update-ytdlp.sh
 ```
 
+Use `bash deploy/diagnose-download.sh` to compare direct and WARP downloads for
+the configured YouTube channels; add `--wait` to wait for a live stream.
+
 ## Check health
 
 Check whether the service is running:
