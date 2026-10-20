@@ -8,12 +8,32 @@ TEMP_DIR="/tmp/ytdiag"
 REPORT_FILE="$HOME/ytdiag-report.txt"
 USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
-if [[ $# -gt 1 || ( $# -eq 1 && "$1" != "--wait" ) ]]; then
-    echo "Usage: $0 [--wait]"
-    exit 2
-fi
 WAIT_MODE=0
-if [[ $# -eq 1 ]]; then WAIT_MODE=1; fi
+TEST_URL=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --wait)
+            if [[ $WAIT_MODE -eq 1 || -n "$TEST_URL" ]]; then
+                echo "Usage: $0 [--wait | --url URL]"
+                exit 2
+            fi
+            WAIT_MODE=1
+            shift
+            ;;
+        --url)
+            if [[ -n "$TEST_URL" || $WAIT_MODE -eq 1 || $# -lt 2 || -z "$2" ]]; then
+                echo "Usage: $0 [--wait | --url URL]"
+                exit 2
+            fi
+            TEST_URL="$2"
+            shift 2
+            ;;
+        *)
+            echo "Usage: $0 [--wait | --url URL]"
+            exit 2
+            ;;
+    esac
+done
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "config.json not found at $CONFIG_FILE"
@@ -78,6 +98,13 @@ check_page() {
 }
 
 echo "YouTube /live page checks:"
+if [[ -n "$TEST_URL" ]]; then
+    SELECTED_NAME="test-stream"
+    SELECTED_URL="$TEST_URL"
+    SELECTED_QUALITY="480p"
+    check_page "$SELECTED_NAME" "$SELECTED_URL" direct
+    check_page "$SELECTED_NAME" "$SELECTED_URL" proxy
+fi
 for channel in "${CHANNELS[@]}"; do
     IFS=$'\t' read -r channel_name channel_url channel_quality <<< "$channel"
     check_page "$channel_name" "$channel_url" direct
@@ -85,17 +112,24 @@ for channel in "${CHANNELS[@]}"; do
 done
 
 is_live_now() {
-    local url="$1" output last_line
-    output="$(timeout -s INT 30 "$YTDLP_BIN" --simulate --no-warnings --print '%(is_live)s' "$url" 2>/dev/null || true)"
+    local name="$1" url="$2" output stderr_file last_line error_line
+    stderr_file="$TEMP_DIR/live-check-${name}.stderr"
+    output="$(timeout -s INT 30 "$YTDLP_BIN" --simulate --no-warnings --print '%(is_live)s' "$url" 2>"$stderr_file" || true)"
     last_line="$(printf '%s\n' "$output" | tail -n 1 | tr -d '\r')"
-    [[ "$last_line" == "True" ]]
+    if [[ "$last_line" == "True" ]]; then
+        return 0
+    fi
+    error_line="$(grep -i -m 1 'ERROR' "$stderr_file" 2>/dev/null | head -n 1 | cut -c1-120 || true)"
+    if [[ -z "$error_line" ]]; then error_line="no error text"; fi
+    printf '  %s: not live (%s)\n' "$name" "$error_line"
+    return 1
 }
 
 select_live_channel() {
     local channel name url quality
     for channel in "${CHANNELS[@]}"; do
         IFS=$'\t' read -r name url quality <<< "$channel"
-        if is_live_now "$url"; then
+        if is_live_now "$name" "$url"; then
             SELECTED_NAME="$name"
             SELECTED_URL="$url"
             SELECTED_QUALITY="$quality"
@@ -162,6 +196,10 @@ run_experiments() {
 }
 
 if [[ $WAIT_MODE -eq 0 ]]; then
+    if [[ -n "$TEST_URL" ]]; then
+        run_experiments
+        exit 0
+    fi
     if ! select_live_channel; then
         echo "NO CHANNEL IS LIVE"
         exit 3
