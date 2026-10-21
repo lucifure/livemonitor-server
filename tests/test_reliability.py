@@ -63,7 +63,7 @@ def player_html(live=True):
 def bot_check_html():
     data = {"playabilityStatus": {"status": "LOGIN_REQUIRED",
                                   "reason": "Sign in to confirm that you're not a bot"}}
-    return "<script>ytInitialPlayerResponse = " + json.dumps(data) + ";</script>"
+    return "<script>ytInitialPlayerResponse=" + json.dumps(data) + ";</script>"
 
 
 def response(text, status_code=200, url="https://www.youtube.com/@a/live"):
@@ -108,7 +108,8 @@ def test_blocked_page_logs_are_rate_limited_and_recovery_is_logged(monkeypatch):
 
 
 def test_offline_channel_page_is_a_successful_non_live_check(monkeypatch):
-    html = '<script>var ytInitialData = {}; ytInitialPlayerResponse,a.ytInitialReelWatchSequenceResponse;</script>'
+    html = ('<script>var ytInitialData = {}; ytInitialPlayerResponse,a.ytInitialReelWatchSequenceResponse; '
+            'var o={"a":1}; function later(){return {"b":2};}</script>')
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(html))
     assert server.check_live("https://youtube.com/@a/live", "", "a") is None
     assert server.STATE["a"]["last_error"] is None
@@ -141,6 +142,24 @@ def test_live_page_still_returns_video_id_and_title(monkeypatch):
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(player_html()))
     assert server.check_live("https://youtube.com/@a/live", "", "a") == {
         "video_id": "abc", "title": "A live show"}
+
+
+@pytest.mark.parametrize("assignment", ["var ytInitialPlayerResponse = ", "ytInitialPlayerResponse="])
+def test_strict_player_assignment_accepts_whitespace_variants(monkeypatch, assignment):
+    data = {"videoDetails": {"videoId": "abc", "title": "A live show", "isLiveContent": True},
+            "playabilityStatus": {"status": "OK"},
+            "streamingData": {"hlsManifestUrl": "https://example/live"}}
+    html = "<script>" + assignment + json.dumps(data) + ";</script>"
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(html))
+    assert server.check_live("https://youtube.com/@a/live", "", "a") == {
+        "video_id": "abc", "title": "A live show"}
+
+
+def test_strict_player_assignment_still_blocks_bot_check(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(bot_check_html()))
+    assert server.check_live("https://youtube.com/@a/live", "", "a") is None
+    assert server.STATE["a"]["last_error"] == "blocked by YouTube (bot check)"
+    assert server.STATE["a"]["backoff_seconds"] == 300
 
 
 def test_blocked_check_followed_by_offline_page_recovers_once(monkeypatch):

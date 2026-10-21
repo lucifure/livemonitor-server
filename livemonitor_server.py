@@ -147,6 +147,14 @@ def extract_balanced_json(html, marker):
     return None
 
 
+def extract_player_response(html):
+    """Parse only an actual ytInitialPlayerResponse assignment."""
+    match = re.search(r"ytInitialPlayerResponse\s*=\s*\{", html)
+    if not match:
+        return None
+    return extract_balanced_json(html[match.start():], "=")
+
+
 def check_live(channel_url, proxy, channel_name):
     import requests
     def request(using_proxy):
@@ -184,7 +192,7 @@ def check_live(channel_url, proxy, channel_name):
                   backoff_seconds=300 if resp.status_code == 429 else 0)
         return None
 
-    data = extract_balanced_json(resp.text, "ytInitialPlayerResponse")
+    data = extract_player_response(resp.text)
     if not data:
         if (resp.status_code == 200
                 and "consent.youtube.com" not in getattr(resp, "url", "")
