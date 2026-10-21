@@ -51,6 +51,7 @@ class FakeProcess:
 @pytest.fixture(autouse=True)
 def clean_state(monkeypatch):
     server.STATE.clear(); server.CONTROL.clear(); server.LOG_BUFFER.clear(); server.GLOBALS.clear()
+    server.BLOCKED_PAGE_CHECKS.clear()
     monkeypatch.setattr(server, "log", lambda name, message: server.LOG_BUFFER.append(message))
 
 
@@ -79,6 +80,50 @@ def test_unknown_and_rate_limited_pages_are_errors_with_five_minute_backoff(monk
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: SimpleNamespace(status_code=429, text=""))
     server.check_live("https://youtube.com/@a", "", "a")
     assert server.STATE["a"]["backoff_seconds"] == 300
+
+
+def test_blocked_page_logs_are_rate_limited_and_recovery_is_logged(monkeypatch):
+    now = [1000]
+    monkeypatch.setattr(server.time, "time", lambda: now[0])
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: SimpleNamespace(status_code=200, text="consent page"))
+    for _ in range(4):
+        server.check_live("https://youtube.com/@a", "", "a")
+    assert sum("unexpected page: no player data" in line for line in server.LOG_BUFFER) == 1
+    now[0] += 3601
+    server.check_live("https://youtube.com/@a", "", "a")
+    assert sum("unexpected page: no player data" in line for line in server.LOG_BUFFER) == 2
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: SimpleNamespace(status_code=200, text=player_html()))
+    assert server.check_live("https://youtube.com/@a", "", "a")["video_id"] == "abc"
+    assert any("page check recovered after 5 blocked checks" in line for line in server.LOG_BUFFER)
+
+
+def _record_stream_with_saved_file(tmp_path, monkeypatch, size, duration):
+    server.GLOBALS["min_free_gb"] = 0
+    monkeypatch.setattr(server.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**12))
+    monkeypatch.setattr(server, "sanitize_filename", lambda title: "show")
+    monkeypatch.setattr(server, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "01012026" if "%d" in fmt else "00-00-00")))
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *args, **kwargs: FakeProcess(1, "one\ntwo\nthree\nfour\n"))
+    ticks = iter((10.0, 10.0 + duration))
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(ticks))
+    def finalize(output_dir, base_name, channel_name):
+        path = tmp_path / f"{base_name}.mp4"
+        path.write_bytes(b"x" * size)
+        return str(path)
+    monkeypatch.setattr(server, "finalize_recording_output", finalize)
+    return server.record_stream("a", "abc", "show", "", str(tmp_path), "480p")
+
+
+def test_nonzero_exit_with_good_saved_recording_is_success(tmp_path, monkeypatch):
+    assert _record_stream_with_saved_file(tmp_path, monkeypatch, 1024 * 1024, 120) is True
+    assert server.STATE["a"]["last_error"] is None
+    assert not any("yt-dlp failed" in line for line in server.LOG_BUFFER)
+    assert any("yt-dlp finished with code 1 (normal at stream end); recording saved" in line for line in server.LOG_BUFFER)
+
+
+@pytest.mark.parametrize(("size", "duration"), [(1024 * 1024 - 1, 120), (1024 * 1024, 119)])
+def test_nonzero_exit_with_small_or_short_saved_recording_still_fails(tmp_path, monkeypatch, size, duration):
+    assert _record_stream_with_saved_file(tmp_path, monkeypatch, size, duration) is False
+    assert any("yt-dlp failed; output tail" in line for line in server.LOG_BUFFER)
 
 
 def test_proxy_failure_retries_once_directly(monkeypatch):

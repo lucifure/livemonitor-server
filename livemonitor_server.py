@@ -26,6 +26,7 @@ STOP_GRACE_SECONDS = 120
 STOP_TERM_SECONDS = 15
 STARTED_AT = int(time.time())
 GLOBALS = {}
+BLOCKED_PAGE_CHECKS = {}
 
 
 def server_version():
@@ -185,7 +186,7 @@ def check_live(channel_url, proxy, channel_name):
 
     data = extract_balanced_json(resp.text, "ytInitialPlayerResponse")
     if not data:
-        log(channel_name, "unexpected page: no player data (possibly consent or bot-check)")
+        _log_blocked_page(channel_name, "unexpected page: no player data (possibly consent or bot-check)")
         set_state(channel_name, last_error="unexpected page: no player data", backoff_seconds=300)
         return None
 
@@ -195,9 +196,13 @@ def check_live(channel_url, proxy, channel_name):
 
     video_id = video_details.get("videoId", "")
     if not video_id:
-        log(channel_name, "unexpected page: player data has no video id")
+        _log_blocked_page(channel_name, "unexpected page: player data has no video id")
         set_state(channel_name, last_error="unexpected page: no video id", backoff_seconds=300)
         return None
+
+    blocked = BLOCKED_PAGE_CHECKS.pop(channel_name, None)
+    if blocked:
+        log(channel_name, f"page check recovered after {blocked['count']} blocked checks")
 
     status_ok = playability.get("status", "") == "OK"
     is_live_content = bool(video_details.get("isLiveContent"))
@@ -214,6 +219,20 @@ def check_live(channel_url, proxy, channel_name):
 
     set_state(channel_name, last_error=None, backoff_seconds=0)
     return {"video_id": video_id, "title": video_details.get("title", video_id)}
+
+
+def _log_blocked_page(channel_name, message):
+    now = time.time()
+    blocked = BLOCKED_PAGE_CHECKS.get(channel_name)
+    if blocked is None:
+        BLOCKED_PAGE_CHECKS[channel_name] = {"count": 1, "started_at": now, "last_logged_at": now}
+        log(channel_name, message)
+        return
+    blocked["count"] += 1
+    if now - blocked["last_logged_at"] >= 3600:
+        since = datetime.fromtimestamp(blocked["started_at"]).strftime("%H:%M")
+        log(channel_name, f"{message} (still blocked; {blocked['count']} checks since {since})")
+        blocked["last_logged_at"] = now
 
 
 def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
@@ -300,16 +319,29 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
             set_state(channel_name, status="finalizing")
         duration = max(0, int(time.monotonic() - started))
         set_state(channel_name, last_recording_duration_seconds=duration)
-        log(channel_name, f"yt-dlp exited with code {return_code}")
         set_state(channel_name, status="finalizing")
         finalized_path = finalize_recording_output(output_dir, base_name, channel_name)
         cleanup_empty_recording_files(output_dir, base_name)
         if return_code and not stopped_by_user:
-            tail = "\n".join(list(output_lines)[-10:])
-            log(channel_name, f"yt-dlp failed; output tail: {tail or '(no output)'}")
-            set_state(channel_name, last_error=f"yt-dlp exited with code {return_code}")
-            cleanup_empty_recording_files(output_dir, base_name)
-            return False
+            usable_saved_file = (finalized_path is not None and finalized_path is not False
+                                 and os.path.isfile(finalized_path)
+                                 and os.path.getsize(finalized_path) >= 1024 * 1024
+                                 and duration >= 120)
+            if usable_saved_file:
+                log(channel_name, f"yt-dlp finished with code {return_code} (normal at stream end); recording saved")
+                for line in list(output_lines)[-3:]:
+                    if line:
+                        log(channel_name, line)
+                set_state(channel_name, last_error=None)
+            else:
+                log(channel_name, f"yt-dlp exited with code {return_code}")
+                tail = "\n".join(list(output_lines)[-10:])
+                log(channel_name, f"yt-dlp failed; output tail: {tail or '(no output)'}")
+                set_state(channel_name, last_error=f"yt-dlp exited with code {return_code}")
+                cleanup_empty_recording_files(output_dir, base_name)
+                return False
+        else:
+            log(channel_name, f"yt-dlp exited with code {return_code}")
 
         if finalized_path is None:
             if stopped_by_user:
