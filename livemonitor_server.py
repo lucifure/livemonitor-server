@@ -186,6 +186,14 @@ def check_live(channel_url, proxy, channel_name):
 
     data = extract_balanced_json(resp.text, "ytInitialPlayerResponse")
     if not data:
+        if (resp.status_code == 200
+                and "consent.youtube.com" not in getattr(resp, "url", "")
+                and "ytInitialData" in resp.text):
+            blocked = BLOCKED_PAGE_CHECKS.pop(channel_name, None)
+            if blocked:
+                log(channel_name, f"page check recovered after {blocked['count']} blocked checks")
+            set_state(channel_name, last_error=None, backoff_seconds=0)
+            return None
         _log_blocked_page(channel_name, "unexpected page: no player data (possibly consent or bot-check)")
         set_state(channel_name, last_error="unexpected page: no player data", backoff_seconds=300)
         return None
@@ -193,6 +201,13 @@ def check_live(channel_url, proxy, channel_name):
     video_details = data.get("videoDetails") or {}
     playability = data.get("playabilityStatus") or {}
     streaming_data = data.get("streamingData") or {}
+
+    playability_reason = str(playability.get("reason", ""))
+    if (playability.get("status") == "LOGIN_REQUIRED"
+            or "not a bot" in playability_reason.lower()):
+        _log_blocked_page(channel_name, "blocked by YouTube: sign in to confirm you're not a bot (backoff)")
+        set_state(channel_name, last_error="blocked by YouTube (bot check)", backoff_seconds=300)
+        return None
 
     video_id = video_details.get("videoId", "")
     if not video_id:

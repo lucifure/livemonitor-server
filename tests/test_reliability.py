@@ -60,24 +60,34 @@ def player_html(live=True):
     return "<script>ytInitialPlayerResponse = " + json.dumps(data) + ";</script>"
 
 
+def bot_check_html():
+    data = {"playabilityStatus": {"status": "LOGIN_REQUIRED",
+                                  "reason": "Sign in to confirm that you're not a bot"}}
+    return "<script>ytInitialPlayerResponse = " + json.dumps(data) + ";</script>"
+
+
+def response(text, status_code=200, url="https://www.youtube.com/@a/live"):
+    return SimpleNamespace(status_code=status_code, text=text, url=url)
+
+
 def test_errors_keep_status_and_clear_on_next_success(monkeypatch):
     server.set_state("a", status="idle")
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: (_ for _ in ()).throw(requests.ConnectionError("down")))
     assert server.check_live("https://youtube.com/@a", "", "a") is None
     assert server.STATE["a"]["status"] == "idle"
     assert "request failed" in server.STATE["a"]["last_error"]
-    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: SimpleNamespace(status_code=200, text=player_html()))
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(player_html()))
     assert server.check_live("https://youtube.com/@a", "", "a")["video_id"] == "abc"
     assert server.STATE["a"]["last_error"] is None
 
 
 def test_unknown_and_rate_limited_pages_are_errors_with_five_minute_backoff(monkeypatch):
     server.set_state("a", status="idle")
-    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: SimpleNamespace(status_code=200, text="consent page"))
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response("consent page"))
     assert server.check_live("https://youtube.com/@a", "", "a") is None
     assert server.STATE["a"]["last_error"].startswith("unexpected page")
     assert server.STATE["a"]["backoff_seconds"] == 300
-    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: SimpleNamespace(status_code=429, text=""))
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response("", status_code=429))
     server.check_live("https://youtube.com/@a", "", "a")
     assert server.STATE["a"]["backoff_seconds"] == 300
 
@@ -85,16 +95,64 @@ def test_unknown_and_rate_limited_pages_are_errors_with_five_minute_backoff(monk
 def test_blocked_page_logs_are_rate_limited_and_recovery_is_logged(monkeypatch):
     now = [1000]
     monkeypatch.setattr(server.time, "time", lambda: now[0])
-    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: SimpleNamespace(status_code=200, text="consent page"))
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response("consent page"))
     for _ in range(4):
         server.check_live("https://youtube.com/@a", "", "a")
     assert sum("unexpected page: no player data" in line for line in server.LOG_BUFFER) == 1
     now[0] += 3601
     server.check_live("https://youtube.com/@a", "", "a")
     assert sum("unexpected page: no player data" in line for line in server.LOG_BUFFER) == 2
-    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: SimpleNamespace(status_code=200, text=player_html()))
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(player_html()))
     assert server.check_live("https://youtube.com/@a", "", "a")["video_id"] == "abc"
     assert any("page check recovered after 5 blocked checks" in line for line in server.LOG_BUFFER)
+
+
+def test_offline_channel_page_is_a_successful_non_live_check(monkeypatch):
+    html = '<script>var ytInitialData = {}; ytInitialPlayerResponse,a.ytInitialReelWatchSequenceResponse;</script>'
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(html))
+    assert server.check_live("https://youtube.com/@a/live", "", "a") is None
+    assert server.STATE["a"]["last_error"] is None
+    assert server.STATE["a"]["backoff_seconds"] == 0
+    assert not any("unexpected page" in line for line in server.LOG_BUFFER)
+
+
+def test_bot_check_is_blocked_and_rate_limited(monkeypatch):
+    now = [1000]
+    monkeypatch.setattr(server.time, "time", lambda: now[0])
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(bot_check_html()))
+    for _ in range(2):
+        assert server.check_live("https://youtube.com/@a/live", "", "a") is None
+    assert server.STATE["a"]["last_error"] == "blocked by YouTube (bot check)"
+    assert server.STATE["a"]["backoff_seconds"] == 300
+    blocked_lines = [line for line in server.LOG_BUFFER if "blocked by YouTube" in line]
+    assert len(blocked_lines) == 1
+    assert server.log_level(blocked_lines[0]) == "WARNING"
+
+
+def test_garbage_page_remains_unexpected(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response("garbage"))
+    assert server.check_live("https://youtube.com/@a/live", "", "a") is None
+    assert server.STATE["a"]["last_error"].startswith("unexpected page")
+    assert server.STATE["a"]["backoff_seconds"] == 300
+    assert any("unexpected page: no player data" in line for line in server.LOG_BUFFER)
+
+
+def test_live_page_still_returns_video_id_and_title(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(player_html()))
+    assert server.check_live("https://youtube.com/@a/live", "", "a") == {
+        "video_id": "abc", "title": "A live show"}
+
+
+def test_blocked_check_followed_by_offline_page_recovers_once(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(bot_check_html()))
+    server.check_live("https://youtube.com/@a/live", "", "a")
+    offline = '<script>ytInitialData = {}; ytInitialPlayerResponse,a.ytInitialReelWatchSequenceResponse;</script>'
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(offline))
+    assert server.check_live("https://youtube.com/@a/live", "", "a") is None
+    assert server.check_live("https://youtube.com/@a/live", "", "a") is None
+    recovery = [line for line in server.LOG_BUFFER if "page check recovered after" in line]
+    assert len(recovery) == 1
+    assert server.log_level(recovery[0]) == "INFO"
 
 
 def _record_stream_with_saved_file(tmp_path, monkeypatch, size, duration):
