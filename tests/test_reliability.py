@@ -174,12 +174,16 @@ def test_blocked_check_followed_by_offline_page_recovers_once(monkeypatch):
     assert server.log_level(recovery[0]) == "INFO"
 
 
-def _record_stream_with_saved_file(tmp_path, monkeypatch, size, duration):
+def _record_stream_with_saved_file(tmp_path, monkeypatch, size, duration, live_check=None):
     server.GLOBALS["min_free_gb"] = 0
+    server.set_state("a", url="https://youtube.com/@a/live", last_error=None)
     monkeypatch.setattr(server.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**12))
     monkeypatch.setattr(server, "sanitize_filename", lambda title: "show")
     monkeypatch.setattr(server, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "01012026" if "%d" in fmt else "00-00-00")))
-    monkeypatch.setattr(server.subprocess, "Popen", lambda *args, **kwargs: FakeProcess(1, "one\ntwo\nthree\nfour\n"))
+    output = "".join(f"line {n}\n" for n in range(1, 21))
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *args, **kwargs: FakeProcess(1, output))
+    if live_check is not None:
+        monkeypatch.setattr(server, "check_live", live_check)
     ticks = iter((10.0, 10.0 + duration))
     monkeypatch.setattr(server.time, "monotonic", lambda: next(ticks))
     def finalize(output_dir, base_name, channel_name):
@@ -190,11 +194,36 @@ def _record_stream_with_saved_file(tmp_path, monkeypatch, size, duration):
     return server.record_stream("a", "abc", "show", "", str(tmp_path), "480p")
 
 
-def test_nonzero_exit_with_good_saved_recording_is_success(tmp_path, monkeypatch):
-    assert _record_stream_with_saved_file(tmp_path, monkeypatch, 1024 * 1024, 120) is True
+def test_nonzero_exit_with_good_saved_recording_still_live_logs_15_lines(tmp_path, monkeypatch):
+    assert _record_stream_with_saved_file(
+        tmp_path, monkeypatch, 1024 * 1024, 120,
+        live_check=lambda *args: {"video_id": "abc", "title": "show"}) is True
     assert server.STATE["a"]["last_error"] is None
     assert not any("yt-dlp failed" in line for line in server.LOG_BUFFER)
-    assert any("yt-dlp finished with code 1 (normal at stream end); recording saved" in line for line in server.LOG_BUFFER)
+    summary = "yt-dlp ended early (code 1) while the stream is still live; recording saved, a new recording will start"
+    assert summary in server.LOG_BUFFER
+    assert server.LOG_BUFFER.index("line 6") < server.LOG_BUFFER.index(summary)
+    assert [line for line in server.LOG_BUFFER if line.startswith("line ")] == [
+        f"line {n}" for n in range(6, 21)]
+
+
+def test_nonzero_exit_with_good_saved_recording_offline_logs_normal_summary(tmp_path, monkeypatch):
+    assert _record_stream_with_saved_file(
+        tmp_path, monkeypatch, 1024 * 1024, 120,
+        live_check=lambda *args: None) is True
+    assert any("yt-dlp finished with code 1 (normal at stream end); recording saved" in line
+               for line in server.LOG_BUFFER)
+
+
+def test_nonzero_exit_with_good_saved_recording_live_check_error_is_unknown(tmp_path, monkeypatch):
+    def failed_check(*args):
+        server.set_state("a", last_error="request failed: down")
+        return None
+
+    assert _record_stream_with_saved_file(
+        tmp_path, monkeypatch, 1024 * 1024, 120, live_check=failed_check) is True
+    assert any("(normal at stream end; live status unknown); recording saved" in line
+               for line in server.LOG_BUFFER)
 
 
 @pytest.mark.parametrize(("size", "duration"), [(1024 * 1024 - 1, 120), (1024 * 1024, 119)])

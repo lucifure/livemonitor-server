@@ -351,10 +351,23 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
                                  and os.path.getsize(finalized_path) >= 1024 * 1024
                                  and duration >= 120)
             if usable_saved_file:
-                log(channel_name, f"yt-dlp finished with code {return_code} (normal at stream end); recording saved")
-                for line in list(output_lines)[-3:]:
-                    if line:
-                        log(channel_name, line)
+                output_tail = [line for line in output_lines if line.strip()][-15:]
+                for line in output_tail:
+                    log(channel_name, line)
+                try:
+                    channel_url = STATE.get(channel_name, {}).get("url")
+                    live_info = check_live(channel_url, proxy, channel_name) if channel_url else None
+                    check_failed = bool(STATE.get(channel_name, {}).get("last_error"))
+                except Exception:
+                    live_info = None
+                    check_failed = True
+                if check_failed:
+                    summary = f"yt-dlp finished with code {return_code} (normal at stream end; live status unknown); recording saved"
+                elif live_info and live_info.get("video_id") == video_id:
+                    summary = f"yt-dlp ended early (code {return_code}) while the stream is still live; recording saved, a new recording will start"
+                else:
+                    summary = f"yt-dlp finished with code {return_code} (normal at stream end); recording saved"
+                log(channel_name, summary)
                 set_state(channel_name, last_error=None)
             else:
                 log(channel_name, f"yt-dlp exited with code {return_code}")
