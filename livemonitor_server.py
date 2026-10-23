@@ -27,6 +27,9 @@ STOP_TERM_SECONDS = 15
 STARTED_AT = int(time.time())
 GLOBALS = {}
 BLOCKED_PAGE_CHECKS = {}
+FALLBACK_CHECK_AT = {}
+WORKING_CLIENTS = {}
+PLAYER_CLIENTS = ("default", "tv", "mweb", "android_vr")
 
 
 def server_version():
@@ -87,6 +90,7 @@ def get_status():
         c.pop("base_name", None)
         c.setdefault("last_check_at", 0.0)
         c.setdefault("last_live_at", 0.0)
+        c.setdefault("blocked_since", 0.0)
         # Android displays JSON null literally.  These fields are always text.
         for field in ("title", "last_error", "video_id"):
             c[field] = c.get(field) or ""
@@ -202,7 +206,7 @@ def check_live(channel_url, proxy, channel_name):
             blocked = BLOCKED_PAGE_CHECKS.pop(channel_name, None)
             if blocked:
                 log(channel_name, f"page check recovered after {blocked['count']} blocked checks")
-            set_state(channel_name, last_error=None, backoff_seconds=0)
+            set_state(channel_name, last_error=None, backoff_seconds=0, blocked_since=0.0)
             return None
         _log_blocked_page(channel_name, "unexpected page: no player data (possibly consent or bot-check)")
         set_state(channel_name, last_error="unexpected page: no player data", backoff_seconds=300)
@@ -215,9 +219,10 @@ def check_live(channel_url, proxy, channel_name):
     playability_reason = str(playability.get("reason", ""))
     if (playability.get("status") == "LOGIN_REQUIRED"
             or "not a bot" in playability_reason.lower()):
+        set_state(channel_name, blocked_since=STATE.get(channel_name, {}).get("blocked_since") or time.time())
         _log_blocked_page(channel_name, "blocked by YouTube: sign in to confirm you're not a bot (backoff)")
         set_state(channel_name, last_error="blocked by YouTube (bot check)", backoff_seconds=300)
-        return None
+        return fallback_check_live(channel_url, proxy, channel_name)
 
     video_id = video_details.get("videoId", "")
     if not video_id:
@@ -239,11 +244,75 @@ def check_live(channel_url, proxy, channel_name):
 
     if not (status_ok and is_live_content and has_playable):
         # This is a successful non-live check, not an error.
-        set_state(channel_name, last_error=None, backoff_seconds=0)
+        set_state(channel_name, last_error=None, backoff_seconds=0, blocked_since=0.0)
         return None
 
-    set_state(channel_name, last_error=None, backoff_seconds=0)
+    set_state(channel_name, last_error=None, backoff_seconds=0, blocked_since=0.0)
     return {"video_id": video_id, "title": video_details.get("title", video_id)}
+
+
+def _cookies_args():
+    path = GLOBALS.get("cookies_file", "")
+    return ["--cookies", path] if path and os.path.isfile(path) else []
+
+
+def _looks_like_bot_check(text):
+    text = (text or "").lower()
+    return ("login_required" in text or "not a bot" in text
+            or "confirm you're not a bot" in text
+            or "confirm that you're not a bot" in text)
+
+
+def fallback_check_live(channel_url, proxy, channel_name):
+    now = time.time()
+    if channel_name in FALLBACK_CHECK_AT and now - FALLBACK_CHECK_AT[channel_name] < 300:
+        return None
+    FALLBACK_CHECK_AT[channel_name] = now
+    output = ""
+    saw_bot_check = False
+    for client in PLAYER_CLIENTS:
+        cmd = [YTDLP_BIN, "--simulate", "--print", "%(is_live)s\t%(id)s\t%(title)s",
+               "--no-warnings", "--force-ipv4", "--no-update"] + _cookies_args()
+        if client != "default":
+            cmd += ["--extractor-args", f"youtube:player_client={client}"]
+        if proxy:
+            cmd += ["--proxy", proxy]
+        cmd.append(channel_url)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+        except subprocess.TimeoutExpired as e:
+            output = f"{e.stdout or ''}\n{e.stderr or ''}"
+            continue
+        except Exception as e:
+            output = str(e)
+            continue
+        output = f"{result.stdout or ''}\n{result.stderr or ''}"
+        saw_bot_check = saw_bot_check or _looks_like_bot_check(output)
+        if proxy and result.returncode and "proxy" in output.lower():
+            log(channel_name, "yt-dlp live-check via proxy failed; retrying directly")
+            direct_cmd = cmd[:]
+            direct_cmd[direct_cmd.index("--proxy"):direct_cmd.index("--proxy") + 2] = []
+            try:
+                result = subprocess.run(direct_cmd, capture_output=True, text=True, timeout=30, check=False)
+                output = f"{result.stdout or ''}\n{result.stderr or ''}"
+                saw_bot_check = saw_bot_check or _looks_like_bot_check(output)
+                if result.returncode == 0:
+                    log(channel_name, "yt-dlp live-check succeeded directly after proxy failure")
+            except Exception as e:
+                output = str(e)
+                continue
+        for line in (result.stdout or "").splitlines():
+            fields = line.split("\t", 2)
+            valid_id = len(fields) == 3 and re.fullmatch(r"[A-Za-z0-9_-]{6,20}", fields[1].strip())
+            if len(fields) == 3 and fields[0].strip().lower() == "true" and valid_id:
+                WORKING_CLIENTS[channel_name] = client
+                set_state(channel_name, last_error=None, backoff_seconds=0, blocked_since=0.0)
+                BLOCKED_PAGE_CHECKS.pop(channel_name, None)
+                return {"video_id": fields[1].strip(), "title": fields[2].strip() or fields[1].strip()}
+    if saw_bot_check or _looks_like_bot_check(output):
+        set_state(channel_name, last_error="blocked by YouTube (bot check)", backoff_seconds=300,
+                  blocked_since=STATE.get(channel_name, {}).get("blocked_since") or time.time())
+    return None
 
 
 def _log_blocked_page(channel_name, message):
@@ -284,6 +353,10 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         "--no-part", "--force-overwrites",
         "-o", output_template, video_url,
     ]
+    cmd.extend(_cookies_args())
+    working_client = WORKING_CLIENTS.get(channel_name, "default")
+    if working_client != "default":
+        cmd[1:1] = ["--extractor-args", f"youtube:player_client={working_client}"]
     if proxy:
         cmd[1:1] = ["--proxy", proxy]
 
@@ -339,6 +412,35 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
             time.sleep(1)
         return_code = process.wait()
         reader.join(timeout=2)
+        output_text = "\n".join(output_lines)
+        if return_code and _looks_like_bot_check(output_text):
+            try:
+                next_client = PLAYER_CLIENTS[PLAYER_CLIENTS.index(working_client) + 1]
+            except (ValueError, IndexError):
+                next_client = None
+            if next_client and not stop_now.is_set():
+                log(channel_name, f"yt-dlp bot check with player client {working_client}; retrying with {next_client}")
+                cleanup_empty_recording_files(output_dir, base_name)
+                retry_cmd = [arg for arg in cmd if arg not in ("--extractor-args", f"youtube:player_client={working_client}")]
+                retry_cmd[1:1] = ["--extractor-args", f"youtube:player_client={next_client}"]
+                retry_process = subprocess.Popen(retry_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                 text=True, errors="replace", bufsize=1, start_new_session=True)
+                retry_lines = deque(maxlen=200)
+                retry_reader = threading.Thread(target=read_process_output, args=(retry_process.stdout, retry_lines), daemon=True)
+                retry_reader.start()
+                while retry_process.poll() is None and not stop_now.is_set():
+                    time.sleep(1)
+                if stop_now.is_set() and retry_process.poll() is None:
+                    stopped_by_user = True
+                    try:
+                        os.killpg(retry_process.pid, signal.SIGINT)
+                    except ProcessLookupError:
+                        pass
+                return_code = retry_process.wait()
+                retry_reader.join(timeout=2)
+                output_lines = retry_lines
+                if return_code == 0:
+                    WORKING_CLIENTS[channel_name] = next_client
         if stop_now.is_set():
             stopped_by_user = True
             set_state(channel_name, status="finalizing")
@@ -736,6 +838,7 @@ def main():
     GLOBALS["output_dir"] = config.get("output_dir", os.path.expanduser("~/recordings"))
     GLOBALS["poll_interval"] = int(config.get("poll_interval_seconds", 60))
     GLOBALS["min_free_gb"] = config.get("min_free_gb", 3)
+    GLOBALS["cookies_file"] = config.get("cookies_file", "")
     GLOBALS["version"] = server_version()
     log("server", f"LiveMonitor server version {GLOBALS['version']}")
     channels = config.get("channels", [])

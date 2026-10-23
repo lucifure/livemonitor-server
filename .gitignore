@@ -1,4 +1,5 @@
 config.json
+cookies*.txt
 *.backup-*
 __pycache__/
 *.log

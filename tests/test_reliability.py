@@ -52,6 +52,8 @@ class FakeProcess:
 def clean_state(monkeypatch):
     server.STATE.clear(); server.CONTROL.clear(); server.LOG_BUFFER.clear(); server.GLOBALS.clear()
     server.BLOCKED_PAGE_CHECKS.clear()
+    server.FALLBACK_CHECK_AT.clear()
+    server.WORKING_CLIENTS.clear()
     monkeypatch.setattr(server, "log", lambda name, message: server.LOG_BUFFER.append(message))
 
 
@@ -121,6 +123,7 @@ def test_bot_check_is_blocked_and_rate_limited(monkeypatch):
     now = [1000]
     monkeypatch.setattr(server.time, "time", lambda: now[0])
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(bot_check_html()))
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="", stderr="Sign in to confirm you're not a bot"))
     for _ in range(2):
         assert server.check_live("https://youtube.com/@a/live", "", "a") is None
     assert server.STATE["a"]["last_error"] == "blocked by YouTube (bot check)"
@@ -157,9 +160,86 @@ def test_strict_player_assignment_accepts_whitespace_variants(monkeypatch, assig
 
 def test_strict_player_assignment_still_blocks_bot_check(monkeypatch):
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(bot_check_html()))
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="", stderr="Sign in to confirm you're not a bot"))
     assert server.check_live("https://youtube.com/@a/live", "", "a") is None
     assert server.STATE["a"]["last_error"] == "blocked by YouTube (bot check)"
     assert server.STATE["a"]["backoff_seconds"] == 300
+
+
+def test_blocked_page_falls_back_to_ytdlp_and_remembers_client(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(bot_check_html()))
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if "--extractor-args" in cmd and cmd[cmd.index("--extractor-args") + 1] == "youtube:player_client=tv":
+            return SimpleNamespace(returncode=0, stdout="True\tabc123\tA live show\n", stderr="")
+        return SimpleNamespace(returncode=1, stdout="", stderr="blocked")
+    monkeypatch.setattr(subprocess, "run", run)
+    assert server.check_live("https://youtube.com/@a/live", "", "a") == {"video_id": "abc123", "title": "A live show"}
+    assert server.WORKING_CLIENTS["a"] == "tv"
+    assert server.STATE["a"]["blocked_since"] == 0.0
+    assert calls[0][0] == server.YTDLP_BIN and "--simulate" in calls[0]
+
+
+def test_blocked_fallback_retains_backoff_and_blocked_since(monkeypatch):
+    now = [1234.5]
+    monkeypatch.setattr(server.time, "time", lambda: now[0])
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(bot_check_html()))
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="", stderr="LOGIN_REQUIRED: not a bot"))
+    assert server.check_live("https://youtube.com/@a/live", "", "a") is None
+    assert server.STATE["a"]["blocked_since"] == 1234.5
+    assert server.STATE["a"]["backoff_seconds"] == 300
+    assert server.STATE["a"]["last_error"] == "blocked by YouTube (bot check)"
+
+
+def test_fallback_rate_limited_per_channel(monkeypatch):
+    now = [5000.0]
+    monkeypatch.setattr(server.time, "time", lambda: now[0])
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append(args[0]) or SimpleNamespace(returncode=1, stdout="", stderr="blocked"))
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    assert len(calls) == 4
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    assert len(calls) == 4
+    now[0] += 300
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    assert len(calls) == 8
+
+
+def test_cookies_flag_only_when_configured_file_exists(tmp_path, monkeypatch):
+    cookie_path = tmp_path / "private-cookies.txt"
+    server.GLOBALS["cookies_file"] = str(cookie_path)
+    assert server._cookies_args() == []
+    cookie_path.write_text("secret-cookie-value")
+    assert server._cookies_args() == ["--cookies", str(cookie_path)]
+    assert "secret-cookie-value" not in "\n".join(server.LOG_BUFFER)
+
+
+def test_recording_command_uses_remembered_client_and_existing_cookies(tmp_path, monkeypatch):
+    server.GLOBALS.update(min_free_gb=0, cookies_file=str(tmp_path / "cookies.txt"))
+    (tmp_path / "cookies.txt").write_text("private-value")
+    server.WORKING_CLIENTS["a"] = "mweb"
+    monkeypatch.setattr(server.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**12))
+    monkeypatch.setattr(server, "finalize_recording_output", lambda *args: None)
+    seen = []
+    monkeypatch.setattr(server.subprocess, "Popen", lambda cmd, **kwargs: seen.append(cmd) or FakeProcess(0, ""))
+    assert server.record_stream("a", "abc123", "show", "", str(tmp_path), "480p") is False
+    assert "--cookies" in seen[0] and str(tmp_path / "cookies.txt") in seen[0]
+    assert "--extractor-args" in seen[0]
+    assert "youtube:player_client=mweb" in seen[0]
+    assert "private-value" not in "\n".join(server.LOG_BUFFER)
+
+
+def test_recording_bot_check_retries_once_with_next_client(tmp_path, monkeypatch):
+    server.GLOBALS["min_free_gb"] = 0
+    monkeypatch.setattr(server.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**12))
+    monkeypatch.setattr(server, "finalize_recording_output", lambda *args: None)
+    commands = []
+    processes = iter((FakeProcess(1, "ERROR: Sign in to confirm that you're not a bot\n"), FakeProcess(0, "")))
+    monkeypatch.setattr(server.subprocess, "Popen", lambda cmd, **kwargs: commands.append(cmd) or next(processes))
+    assert server.record_stream("a", "abc123", "show", "", str(tmp_path), "480p") is False
+    assert len(commands) == 2
+    assert "youtube:player_client=tv" in commands[1]
 
 
 def test_blocked_check_followed_by_offline_page_recovers_once(monkeypatch):
@@ -279,6 +359,7 @@ def test_status_uses_empty_strings_and_includes_version():
     server.set_state("a", status="idle", title=None, last_error=None, video_id=None)
     status = server.get_status()
     assert status["version"] == "abc123"
+    assert status["channels"][0]["blocked_since"] == 0.0
     assert {k: status["channels"][0][k] for k in ("title", "last_error", "video_id")} == {"title": "", "last_error": "", "video_id": ""}
     assert status["channels"][0]["last_check_at"] == 0.0
     assert status["channels"][0]["last_live_at"] == 0.0
