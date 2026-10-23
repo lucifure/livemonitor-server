@@ -85,6 +85,8 @@ def get_status():
         channels = [dict(v, name=k) for k, v in STATE.items()]
     for c in channels:
         c.pop("base_name", None)
+        c.setdefault("last_check_at", 0.0)
+        c.setdefault("last_live_at", 0.0)
         # Android displays JSON null literally.  These fields are always text.
         for field in ("title", "last_error", "video_id"):
             c[field] = c.get(field) or ""
@@ -292,7 +294,7 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         set_state(channel_name, status="paused")
         return True
     set_state(channel_name, status="recording", video_id=video_id, title=title,
-              recording_started_at=int(time.time()), base_name=base_name,
+              recording_started_at=int(time.time()), last_live_at=float(time.time()), base_name=base_name,
               last_recording_duration_seconds=0)
     started = time.monotonic()
     succeeded = False
@@ -608,7 +610,8 @@ def monitor_channel(channel):
     consecutive_failures = 0
 
     set_state(name, url=url, quality=quality, status="paused" if ctrl["pause"].is_set() else "idle", video_id=None, title=None,
-              recording_started_at=None, last_check=None, last_error=None, base_name=None)
+              recording_started_at=None, last_check=None, last_check_at=0.0, last_live_at=0.0,
+              last_error=None, base_name=None)
     log(name, f"Monitoring started for {url} (quality={quality})")
     while True:
         if ctrl["remove"].is_set():
@@ -623,8 +626,10 @@ def monitor_channel(channel):
         delay = poll_interval
         try:
             live_info = check_live(url, proxy, name)
-            set_state(name, last_check=int(time.time()))
+            checked_at = float(time.time())
+            set_state(name, last_check=int(checked_at), last_check_at=checked_at)
             if live_info:
+                set_state(name, last_live_at=float(time.time()))
                 if ctrl["pause"].is_set():
                     set_state(name, status="paused")
                     continue

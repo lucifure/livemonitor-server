@@ -280,6 +280,8 @@ def test_status_uses_empty_strings_and_includes_version():
     status = server.get_status()
     assert status["version"] == "abc123"
     assert {k: status["channels"][0][k] for k in ("title", "last_error", "video_id")} == {"title": "", "last_error": "", "video_id": ""}
+    assert status["channels"][0]["last_check_at"] == 0.0
+    assert status["channels"][0]["last_live_at"] == 0.0
 
 
 @pytest.mark.parametrize(("line", "expected"), [
@@ -331,8 +333,10 @@ def test_monitor_rechecks_and_starts_a_new_recording_after_one_ends(monkeypatch)
     server.CONTROL["a"] = {"pause": threading.Event(), "remove": threading.Event()}
     monkeypatch.setattr(server, "check_live", lambda *args: {"video_id": "abc", "title": "show"})
     starts = []
+    checked_times = []
     def record(*args):
         starts.append(args)
+        checked_times.append((server.STATE["a"]["last_check_at"], server.STATE["a"]["last_live_at"]))
         server.set_state("a", last_recording_duration_seconds=120)
         if len(starts) == 2:
             server.CONTROL["a"]["remove"].set()
@@ -343,6 +347,7 @@ def test_monitor_rechecks_and_starts_a_new_recording_after_one_ends(monkeypatch)
     server.monitor_channel(channel)
     assert len(starts) == 2
     assert len(delays) >= 5  # five one-second sleeps make the restart delay responsive to stop.
+    assert all(isinstance(value, float) and value > 0 for pair in checked_times for value in pair)
 
 
 def test_monitor_failure_backoff_grows_and_caps(monkeypatch):
