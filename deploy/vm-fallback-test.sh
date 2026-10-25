@@ -18,6 +18,12 @@ ssh "${SSH_OPTS[@]}" "$LM_HOST" "bash -s -- '$CHANNEL_HANDLE'" <<'REMOTE'
 set -uo pipefail
 handle=$1
 url="https://youtube.com/@${handle}/live"
+YTDLP=/home/ubuntu/.local/bin/yt-dlp
+if [[ ! -x "$YTDLP" ]]; then
+    echo "ERROR: yt-dlp not found at $YTDLP"
+    exit 1
+fi
+echo "yt-dlp version: $($YTDLP --version)"
 tmp_file="$(mktemp)"
 trap 'rm -f "$tmp_file"' EXIT
 
@@ -26,7 +32,7 @@ run_check() {
     shift
     local result
     : > "$tmp_file"
-    if timeout 40 yt-dlp --simulate --print '%(is_live)s %(id)s' --no-warnings \
+    if timeout 40 "$YTDLP" --simulate --print '%(is_live)s %(id)s' --no-warnings \
         --force-ipv4 --proxy http://127.0.0.1:1080 "$@" "$url" >"$tmp_file" 2>&1; then
         result=0
     else

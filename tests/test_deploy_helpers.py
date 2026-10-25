@@ -1,11 +1,20 @@
 import subprocess
 import sys
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "deploy" / "check_cookies_file.py"
 HEADER = "# Netscape HTTP Cookie File\n"
+FALLBACK_TEST = ROOT / "deploy" / "vm-fallback-test.sh"
+
+
+def test_vm_fallback_uses_configured_ytdlp_path():
+    script = FALLBACK_TEST.read_text(encoding="utf-8")
+    assert 'YTDLP=/home/ubuntu/.local/bin/yt-dlp' in script
+    assert 'timeout 40 "$YTDLP"' in script
+    assert re.search(r"(?m)^\s*(?:timeout\s+\S+\s+)?yt-dlp\b", script) is None
 
 
 def cookie_row(domain, name="PRIVATE_COOKIE_NAME", value="PRIVATE_COOKIE_VALUE"):
