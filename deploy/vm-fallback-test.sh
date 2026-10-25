@@ -13,10 +13,22 @@ if [[ $# -ne 1 || ! "$1" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     exit 2
 fi
 CHANNEL_HANDLE=$1
+if [[ "${LM_NO_PROXY:-}" == "1" ]]; then
+    NO_PROXY=1
+    echo "MODE: direct (no proxy)"
+else
+    NO_PROXY=0
+    echo "MODE: via proxy"
+fi
 
-ssh "${SSH_OPTS[@]}" "$LM_HOST" "bash -s -- '$CHANNEL_HANDLE'" <<'REMOTE'
+ssh "${SSH_OPTS[@]}" "$LM_HOST" "bash -s -- '$CHANNEL_HANDLE' '$NO_PROXY'" <<'REMOTE'
 set -uo pipefail
 handle=$1
+no_proxy=$2
+if [[ ! "$no_proxy" =~ ^[01]$ ]]; then
+    echo "ERROR: proxy mode must be 0 or 1"
+    exit 2
+fi
 url="https://youtube.com/@${handle}/live"
 YTDLP=/home/ubuntu/.local/bin/yt-dlp
 if [[ ! -x "$YTDLP" ]]; then
@@ -32,7 +44,14 @@ run_check() {
     shift
     local result
     : > "$tmp_file"
-    if timeout 40 "$YTDLP" --simulate --print '%(is_live)s %(id)s' --no-warnings \
+    if [[ "$no_proxy" == "1" ]]; then
+        if timeout 40 "$YTDLP" --simulate --print '%(is_live)s %(id)s' --no-warnings \
+            --force-ipv4 "$@" "$url" >"$tmp_file" 2>&1; then
+            result=0
+        else
+            result=$?
+        fi
+    elif timeout 40 "$YTDLP" --simulate --print '%(is_live)s %(id)s' --no-warnings \
         --force-ipv4 --proxy http://127.0.0.1:1080 "$@" "$url" >"$tmp_file" 2>&1; then
         result=0
     else
