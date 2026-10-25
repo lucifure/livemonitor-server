@@ -53,6 +53,7 @@ def clean_state(monkeypatch):
     server.STATE.clear(); server.CONTROL.clear(); server.LOG_BUFFER.clear(); server.GLOBALS.clear()
     server.BLOCKED_PAGE_CHECKS.clear()
     server.FALLBACK_CHECK_AT.clear()
+    server.FALLBACK_LAST_SUMMARY.clear()
     server.WORKING_CLIENTS.clear()
     monkeypatch.setattr(server, "log", lambda name, message: server.LOG_BUFFER.append(message))
 
@@ -204,6 +205,89 @@ def test_fallback_rate_limited_per_channel(monkeypatch):
     now[0] += 300
     server.fallback_check_live("https://youtube.com/@a/live", "", "a")
     assert len(calls) == 8
+
+
+@pytest.mark.parametrize("cookies_exist,expected", [(False, "no"), (True, "yes")])
+def test_fallback_logs_all_bot_check_outcomes_and_cookie_use(tmp_path, monkeypatch, cookies_exist, expected):
+    cookie_path = tmp_path / "private-cookies.txt"
+    server.GLOBALS["cookies_file"] = str(cookie_path)
+    if cookies_exist:
+        cookie_path.write_text("secret")
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=1, stdout="", stderr="Sign in to confirm you're not a bot"))
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    summaries = [line for line in server.LOG_BUFFER if line.startswith("fallback check:")]
+    assert len(summaries) == 1
+    assert all(f"{client}=bot_check" in summaries[0] for client in server.PLAYER_CLIENTS)
+    assert summaries[0].endswith(f"cookies={expected}")
+
+
+def test_fallback_live_logs_client_and_video_id(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kwargs: SimpleNamespace(
+        returncode=0,
+        stdout="True\tabc123\tLive\n" if "youtube:player_client=tv" in cmd else "",
+        stderr=""))
+    assert server.fallback_check_live("https://youtube.com/@a/live", "", "a")["video_id"] == "abc123"
+    assert any("fallback check: tv=live (video abc123) cookies=no" in line for line in server.LOG_BUFFER)
+
+
+def test_fallback_not_currently_live_is_classified(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=1, stdout="", stderr="Video is not currently live"))
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    summary = next(line for line in server.LOG_BUFFER if line.startswith("fallback check:"))
+    assert "default=not_live (Video is not currently live)" in summary
+
+
+def test_fallback_summary_throttles_unchanged_and_logs_changed(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(server.time, "time", lambda: now[0])
+    outcome = ["blocked"]
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=1, stdout="", stderr=outcome[0]))
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    server.FALLBACK_CHECK_AT.clear()
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    assert sum(line.startswith("fallback check:") for line in server.LOG_BUFFER) == 1
+    outcome[0] = "different failure"
+    server.FALLBACK_CHECK_AT.clear()
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    assert sum(line.startswith("fallback check:") for line in server.LOG_BUFFER) == 2
+
+
+def test_fallback_summary_never_logs_cookie_path(monkeypatch, tmp_path):
+    cookie_path = str(tmp_path / "secret-cookies.txt")
+    server.GLOBALS["cookies_file"] = cookie_path
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=1, stdout="", stderr=f"failed to read {cookie_path}"))
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    assert all(cookie_path not in line for line in server.LOG_BUFFER)
+    summary = next(line for line in server.LOG_BUFFER if line.startswith("fallback check:"))
+    assert "<cookies>" in summary
+
+
+@pytest.mark.parametrize("cookies_file,exists,expected", [
+    ("", False, "cookies: not configured"),
+    ("configured-cookie-file", True, "cookies: configured, file present"),
+    ("configured-cookie-file", False, "cookies: configured, file missing"),
+])
+def test_startup_logs_cookie_configuration_without_path(monkeypatch, tmp_path, cookies_file, exists, expected):
+    configured_path = str(tmp_path / cookies_file) if cookies_file else ""
+    if exists:
+        open(configured_path, "w").close()
+    monkeypatch.setattr(server, "load_config", lambda: {"cookies_file": configured_path, "channels": []})
+    monkeypatch.setattr(server, "server_version", lambda: "test")
+    monkeypatch.setattr(server.api_server, "start_api", lambda *args: None)
+    monkeypatch.setattr(server.threading, "Thread", lambda **kwargs: SimpleNamespace(start=lambda: None))
+    class StopMain(Exception):
+        pass
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: (_ for _ in ()).throw(StopMain()))
+    with pytest.raises(StopMain):
+        server.main()
+    cookie_lines = [line for line in server.LOG_BUFFER if line.startswith("cookies:")]
+    assert cookie_lines == [expected]
+    if configured_path:
+        assert configured_path not in "\n".join(cookie_lines)
 
 
 def test_cookies_flag_only_when_configured_file_exists(tmp_path, monkeypatch):

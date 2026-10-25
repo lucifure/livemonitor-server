@@ -28,6 +28,7 @@ STARTED_AT = int(time.time())
 GLOBALS = {}
 BLOCKED_PAGE_CHECKS = {}
 FALLBACK_CHECK_AT = {}
+FALLBACK_LAST_SUMMARY = {}
 WORKING_CLIENTS = {}
 PLAYER_CLIENTS = ("default", "tv", "mweb", "android_vr")
 
@@ -263,6 +264,35 @@ def _looks_like_bot_check(text):
             or "confirm that you're not a bot" in text)
 
 
+def _fallback_output_reason(output):
+    lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    reason = lines[-1] if lines else "no output"
+    cookie_path = GLOBALS.get("cookies_file", "")
+    if cookie_path:
+        reason = reason.replace(cookie_path, "<cookies>")
+    return " ".join(reason.split())[:120]
+
+
+def _log_fallback_summary(channel_name, outcomes, live_info=None):
+    cookies_in_use = bool(_cookies_args())
+    if live_info:
+        summary = f"fallback check: {live_info['client']}=live (video {live_info['video_id']})"
+    else:
+        entries = []
+        for client, outcome, reason in outcomes:
+            entry = f"{client}={outcome}"
+            if outcome in ("error", "not_live"):
+                entry += f" ({reason})"
+            entries.append(entry)
+        summary = "fallback check: " + " ".join(entries)
+    summary += f" cookies={'yes' if cookies_in_use else 'no'}"
+    now = time.time()
+    previous = FALLBACK_LAST_SUMMARY.get(channel_name)
+    if previous is None or previous[0] != summary or now - previous[1] >= 3600:
+        log(channel_name, summary)
+        FALLBACK_LAST_SUMMARY[channel_name] = (summary, now)
+
+
 def fallback_check_live(channel_url, proxy, channel_name):
     now = time.time()
     if channel_name in FALLBACK_CHECK_AT and now - FALLBACK_CHECK_AT[channel_name] < 300:
@@ -270,6 +300,7 @@ def fallback_check_live(channel_url, proxy, channel_name):
     FALLBACK_CHECK_AT[channel_name] = now
     output = ""
     saw_bot_check = False
+    outcomes = []
     for client in PLAYER_CLIENTS:
         cmd = [YTDLP_BIN, "--simulate", "--print", "%(is_live)s\t%(id)s\t%(title)s",
                "--no-warnings", "--force-ipv4", "--no-update"] + _cookies_args()
@@ -282,9 +313,11 @@ def fallback_check_live(channel_url, proxy, channel_name):
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
         except subprocess.TimeoutExpired as e:
             output = f"{e.stdout or ''}\n{e.stderr or ''}"
+            outcomes.append((client, "timeout", ""))
             continue
         except Exception as e:
             output = str(e)
+            outcomes.append((client, "error", _fallback_output_reason(output)))
             continue
         output = f"{result.stdout or ''}\n{result.stderr or ''}"
         saw_bot_check = saw_bot_check or _looks_like_bot_check(output)
@@ -300,15 +333,35 @@ def fallback_check_live(channel_url, proxy, channel_name):
                     log(channel_name, "yt-dlp live-check succeeded directly after proxy failure")
             except Exception as e:
                 output = str(e)
+                outcomes.append((client, "error", _fallback_output_reason(output)))
                 continue
+        outcome = None
         for line in (result.stdout or "").splitlines():
             fields = line.split("\t", 2)
             valid_id = len(fields) == 3 and re.fullmatch(r"[A-Za-z0-9_-]{6,20}", fields[1].strip())
             if len(fields) == 3 and fields[0].strip().lower() == "true" and valid_id:
+                outcome = "live"
                 WORKING_CLIENTS[channel_name] = client
                 set_state(channel_name, last_error=None, backoff_seconds=0, blocked_since=0.0)
                 BLOCKED_PAGE_CHECKS.pop(channel_name, None)
-                return {"video_id": fields[1].strip(), "title": fields[2].strip() or fields[1].strip()}
+                live_info = {"video_id": fields[1].strip(), "title": fields[2].strip() or fields[1].strip(),
+                             "client": client}
+                _log_fallback_summary(channel_name, outcomes, live_info)
+                return {"video_id": live_info["video_id"], "title": live_info["title"]}
+        if outcome is None:
+            lower_output = output.lower()
+            if _looks_like_bot_check(output):
+                outcome = "bot_check"
+            elif "not currently live" in lower_output or (
+                    result.returncode == 0 and any(
+                        line.strip().split("\t", 1)[0].strip().lower() == "false"
+                        for line in (result.stdout or "").splitlines() if line.strip())):
+                outcome = "not_live"
+            else:
+                outcome = "error"
+        reason = _fallback_output_reason(output) if outcome in ("error", "not_live") else ""
+        outcomes.append((client, outcome, reason))
+    _log_fallback_summary(channel_name, outcomes)
     if saw_bot_check or _looks_like_bot_check(output):
         set_state(channel_name, last_error="blocked by YouTube (bot check)", backoff_seconds=300,
                   blocked_since=STATE.get(channel_name, {}).get("blocked_since") or time.time())
@@ -718,6 +771,7 @@ def monitor_channel(channel):
     while True:
         if ctrl["remove"].is_set():
             log(name, "Monitoring stopped (channel removed)")
+            FALLBACK_LAST_SUMMARY.pop(name, None)
             with STATE_LOCK:
                 STATE.pop(name, None)
             return
@@ -839,6 +893,13 @@ def main():
     GLOBALS["poll_interval"] = int(config.get("poll_interval_seconds", 60))
     GLOBALS["min_free_gb"] = config.get("min_free_gb", 3)
     GLOBALS["cookies_file"] = config.get("cookies_file", "")
+    cookies_path = GLOBALS["cookies_file"]
+    if not cookies_path:
+        log("server", "cookies: not configured")
+    elif os.path.isfile(cookies_path):
+        log("server", "cookies: configured, file present")
+    else:
+        log("server", "cookies: configured, file missing")
     GLOBALS["version"] = server_version()
     log("server", f"LiveMonitor server version {GLOBALS['version']}")
     channels = config.get("channels", [])
