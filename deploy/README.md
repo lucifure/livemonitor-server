@@ -102,3 +102,21 @@ sudo systemctl status livemonitor --no-pager
 This does not change `config.json` or recordings because they are not tracked
 by Git. Do not use `git clean` unless you are certain you do not need local
 files.
+
+## One-command helpers from Termux
+
+Run these from the repository checkout on your phone. Set `LM_HOST` or `LM_KEY`
+before a command to override the default VM address or SSH key. Each command
+saves its output in `Documents` on shared storage.
+
+- `deploy/vm-deploy.sh` checks that recordings are idle, then runs the VM deploy
+  script and shows the latest commit and service state.
+- `deploy/vm-restart-if-idle.sh` checks recordings, restarts the service, and
+  waits up to 30 seconds for it to become active.
+- `deploy/vm-install-cookies.sh <local-cookies-file>` checks cookie domains,
+  installs the file with restricted permissions, and updates the VM config.
+  Run the restart helper afterward to apply it.
+- `deploy/check_cookies_file.py <cookies-file>` checks a Netscape cookie file
+  and reports only allowed domains and their counts.
+- `deploy/vm-fallback-test.sh <channel-handle>` runs the yt-dlp fallback check
+  once without cookies and again with the VM cookie file when present.
