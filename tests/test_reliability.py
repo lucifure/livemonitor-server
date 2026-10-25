@@ -53,6 +53,7 @@ def clean_state(monkeypatch):
     server.STATE.clear(); server.CONTROL.clear(); server.LOG_BUFFER.clear(); server.GLOBALS.clear()
     server.BLOCKED_PAGE_CHECKS.clear()
     server.FALLBACK_CHECK_AT.clear()
+    server.FALLBACK_NOT_LIVE_AT.clear()
     server.FALLBACK_LAST_SUMMARY.clear()
     server.WORKING_CLIENTS.clear()
     monkeypatch.setattr(server, "log", lambda name, message: server.LOG_BUFFER.append(message))
@@ -237,6 +238,72 @@ def test_fallback_not_currently_live_is_classified(monkeypatch):
     server.fallback_check_live("https://youtube.com/@a/live", "", "a")
     summary = next(line for line in server.LOG_BUFFER if line.startswith("fallback check:"))
     assert "default=not_live (Video is not currently live)" in summary
+
+
+def test_fallback_not_live_stops_after_first_client_and_clears_state(monkeypatch):
+    server.set_state("a", last_error="old error", blocked_since=10.0, backoff_seconds=300)
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append(args[0]) or SimpleNamespace(
+        returncode=1, stdout="", stderr="ERROR: [youtube:tab] @a: The channel is not currently live"))
+    assert server.fallback_check_live("https://youtube.com/@a/live", "", "a") is None
+    assert len(calls) == 1
+    assert server.STATE["a"]["last_error"] is None
+    assert server.STATE["a"]["blocked_since"] == 0.0
+    assert server.STATE["a"]["backoff_seconds"] == 0
+    assert "a" in server.FALLBACK_NOT_LIVE_AT
+
+
+def test_blocked_check_not_live_stays_clear_during_sixty_second_cooldown(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(server.time, "time", lambda: now[0])
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(bot_check_html()))
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append(args[0]) or SimpleNamespace(
+        returncode=1, stdout="", stderr="The channel is not currently live"))
+    assert server.check_live("https://youtube.com/@a/live", "", "a") is None
+    assert server.STATE["a"]["last_error"] is None
+    assert server.STATE["a"]["blocked_since"] == 0.0
+    assert server.STATE["a"]["backoff_seconds"] == 0
+    assert not any("blocked by YouTube" in line for line in server.LOG_BUFFER)
+    assert len(calls) == 1
+    now[0] += 30
+    assert server.check_live("https://youtube.com/@a/live", "", "a") is None
+    assert server.STATE["a"]["last_error"] is None
+    assert server.STATE["a"]["blocked_since"] == 0.0
+    assert server.STATE["a"]["backoff_seconds"] == 0
+    assert len(calls) == 1
+    now[0] += 31
+    server.check_live("https://youtube.com/@a/live", "", "a")
+    assert len(calls) == 2
+
+
+def test_fallback_all_bot_checks_keeps_five_minute_cooldown(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(server.time, "time", lambda: now[0])
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append(args[0]) or SimpleNamespace(
+        returncode=1, stdout="", stderr="Sign in to confirm you're not a bot"))
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    assert len(calls) == 4
+    assert server.STATE["a"]["last_error"] == "blocked by YouTube (bot check)"
+    assert server.STATE["a"]["backoff_seconds"] == 300
+    now[0] += 61
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    assert len(calls) == 4
+    now[0] += 239
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    assert len(calls) == 8
+
+
+def test_fallback_later_live_client_clears_not_live_conclusion(monkeypatch):
+    server.FALLBACK_NOT_LIVE_AT["a"] = 10.0
+    server.FALLBACK_CHECK_AT["a"] = 9.0
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kwargs: SimpleNamespace(
+        returncode=0,
+        stdout="True\tabc123\tLive\n" if "youtube:player_client=tv" in cmd else "",
+        stderr=""))
+    assert server.fallback_check_live("https://youtube.com/@a/live", "", "a")["video_id"] == "abc123"
+    assert "a" not in server.FALLBACK_NOT_LIVE_AT
 
 
 def test_fallback_summary_throttles_unchanged_and_logs_changed(monkeypatch):

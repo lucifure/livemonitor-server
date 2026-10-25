@@ -28,6 +28,7 @@ STARTED_AT = int(time.time())
 GLOBALS = {}
 BLOCKED_PAGE_CHECKS = {}
 FALLBACK_CHECK_AT = {}
+FALLBACK_NOT_LIVE_AT = {}
 FALLBACK_LAST_SUMMARY = {}
 WORKING_CLIENTS = {}
 PLAYER_CLIENTS = ("default", "tv", "mweb", "android_vr")
@@ -220,10 +221,18 @@ def check_live(channel_url, proxy, channel_name):
     playability_reason = str(playability.get("reason", ""))
     if (playability.get("status") == "LOGIN_REQUIRED"
             or "not a bot" in playability_reason.lower()):
-        set_state(channel_name, blocked_since=STATE.get(channel_name, {}).get("blocked_since") or time.time())
+        live_info = fallback_check_live(channel_url, proxy, channel_name)
+        if live_info:
+            return live_info
+        now = time.time()
+        if (channel_name in FALLBACK_NOT_LIVE_AT
+                and now - FALLBACK_NOT_LIVE_AT[channel_name] <= 120):
+            set_state(channel_name, last_error=None, backoff_seconds=0, blocked_since=0.0)
+            return None
+        set_state(channel_name, blocked_since=STATE.get(channel_name, {}).get("blocked_since") or now)
         _log_blocked_page(channel_name, "blocked by YouTube: sign in to confirm you're not a bot (backoff)")
         set_state(channel_name, last_error="blocked by YouTube (bot check)", backoff_seconds=300)
-        return fallback_check_live(channel_url, proxy, channel_name)
+        return None
 
     video_id = video_details.get("videoId", "")
     if not video_id:
@@ -295,7 +304,9 @@ def _log_fallback_summary(channel_name, outcomes, live_info=None):
 
 def fallback_check_live(channel_url, proxy, channel_name):
     now = time.time()
-    if channel_name in FALLBACK_CHECK_AT and now - FALLBACK_CHECK_AT[channel_name] < 300:
+    cooldown = 60 if (channel_name in FALLBACK_NOT_LIVE_AT
+                      and FALLBACK_NOT_LIVE_AT[channel_name] == FALLBACK_CHECK_AT.get(channel_name)) else 300
+    if channel_name in FALLBACK_CHECK_AT and now - FALLBACK_CHECK_AT[channel_name] < cooldown:
         return None
     FALLBACK_CHECK_AT[channel_name] = now
     output = ""
@@ -347,6 +358,7 @@ def fallback_check_live(channel_url, proxy, channel_name):
                 live_info = {"video_id": fields[1].strip(), "title": fields[2].strip() or fields[1].strip(),
                              "client": client}
                 _log_fallback_summary(channel_name, outcomes, live_info)
+                FALLBACK_NOT_LIVE_AT.pop(channel_name, None)
                 return {"video_id": live_info["video_id"], "title": live_info["title"]}
         if outcome is None:
             lower_output = output.lower()
@@ -361,7 +373,14 @@ def fallback_check_live(channel_url, proxy, channel_name):
                 outcome = "error"
         reason = _fallback_output_reason(output) if outcome in ("error", "not_live") else ""
         outcomes.append((client, outcome, reason))
+        if outcome == "not_live":
+            FALLBACK_NOT_LIVE_AT[channel_name] = now
+            BLOCKED_PAGE_CHECKS.pop(channel_name, None)
+            set_state(channel_name, last_error=None, backoff_seconds=0, blocked_since=0.0)
+            _log_fallback_summary(channel_name, outcomes)
+            return None
     _log_fallback_summary(channel_name, outcomes)
+    FALLBACK_NOT_LIVE_AT.pop(channel_name, None)
     if saw_bot_check or _looks_like_bot_check(output):
         set_state(channel_name, last_error="blocked by YouTube (bot check)", backoff_seconds=300,
                   blocked_since=STATE.get(channel_name, {}).get("blocked_since") or time.time())
