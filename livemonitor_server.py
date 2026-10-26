@@ -30,6 +30,7 @@ BLOCKED_PAGE_CHECKS = {}
 FALLBACK_CHECK_AT = {}
 FALLBACK_NOT_LIVE_AT = {}
 FALLBACK_LAST_SUMMARY = {}
+FALLBACK_FAILURE_KIND = {}
 WORKING_CLIENTS = {}
 PLAYER_CLIENTS = ("default", "tv", "mweb", "android_vr")
 
@@ -224,14 +225,18 @@ def check_live(channel_url, proxy, channel_name):
         live_info = fallback_check_live(channel_url, proxy, channel_name)
         if live_info:
             return live_info
+        failure_kind = FALLBACK_FAILURE_KIND.get(channel_name, "transient")
         now = time.time()
         if (channel_name in FALLBACK_NOT_LIVE_AT
                 and now - FALLBACK_NOT_LIVE_AT[channel_name] <= 120):
             set_state(channel_name, last_error=None, backoff_seconds=0, blocked_since=0.0)
             return None
-        set_state(channel_name, blocked_since=STATE.get(channel_name, {}).get("blocked_since") or now)
-        _log_blocked_page(channel_name, "blocked by YouTube: sign in to confirm you're not a bot (backoff)")
-        set_state(channel_name, last_error="blocked by YouTube (bot check)", backoff_seconds=300)
+        if failure_kind == "bot_check":
+            set_state(channel_name, blocked_since=STATE.get(channel_name, {}).get("blocked_since") or now)
+            _log_blocked_page(channel_name, "blocked by YouTube: sign in to confirm you're not a bot (backoff)")
+            set_state(channel_name, last_error="blocked by YouTube (bot check)", backoff_seconds=300)
+        else:
+            set_state(channel_name, last_error="live check failed (proxy or network)", backoff_seconds=60)
         return None
 
     video_id = video_details.get("videoId", "")
@@ -273,6 +278,21 @@ def _looks_like_bot_check(text):
             or "confirm that you're not a bot" in text)
 
 
+def _proxy_failure_in_output(text):
+    text = (text or "").lower()
+    return "unable to connect to proxy" in text or "tunnel connection failed" in text
+
+
+def _fallback_failure_kind(outcomes):
+    kinds = {outcome[1] if isinstance(outcome, (tuple, list)) else outcome
+             for outcome in outcomes}
+    if "bot_check" in kinds:
+        return "bot_check"
+    if "not_live" in kinds:
+        return "not_live"
+    return "transient"
+
+
 def _fallback_output_reason(output):
     lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
     reason = lines[-1] if lines else "no output"
@@ -304,8 +324,7 @@ def _log_fallback_summary(channel_name, outcomes, live_info=None):
 
 def fallback_check_live(channel_url, proxy, channel_name):
     now = time.time()
-    cooldown = 60 if (channel_name in FALLBACK_NOT_LIVE_AT
-                      and FALLBACK_NOT_LIVE_AT[channel_name] == FALLBACK_CHECK_AT.get(channel_name)) else 300
+    cooldown = 60 if FALLBACK_FAILURE_KIND.get(channel_name) in ("transient", "not_live") else 300
     if channel_name in FALLBACK_CHECK_AT and now - FALLBACK_CHECK_AT[channel_name] < cooldown:
         return None
     FALLBACK_CHECK_AT[channel_name] = now
@@ -359,6 +378,7 @@ def fallback_check_live(channel_url, proxy, channel_name):
                              "client": client}
                 _log_fallback_summary(channel_name, outcomes, live_info)
                 FALLBACK_NOT_LIVE_AT.pop(channel_name, None)
+                FALLBACK_FAILURE_KIND[channel_name] = "live"
                 return {"video_id": live_info["video_id"], "title": live_info["title"]}
         if outcome is None:
             lower_output = output.lower()
@@ -374,6 +394,7 @@ def fallback_check_live(channel_url, proxy, channel_name):
         reason = _fallback_output_reason(output) if outcome in ("error", "not_live") else ""
         outcomes.append((client, outcome, reason))
         if outcome == "not_live":
+            FALLBACK_FAILURE_KIND[channel_name] = "not_live"
             FALLBACK_NOT_LIVE_AT[channel_name] = now
             BLOCKED_PAGE_CHECKS.pop(channel_name, None)
             set_state(channel_name, last_error=None, backoff_seconds=0, blocked_since=0.0)
@@ -381,7 +402,9 @@ def fallback_check_live(channel_url, proxy, channel_name):
             return None
     _log_fallback_summary(channel_name, outcomes)
     FALLBACK_NOT_LIVE_AT.pop(channel_name, None)
-    if saw_bot_check or _looks_like_bot_check(output):
+    failure_kind = _fallback_failure_kind(outcomes)
+    FALLBACK_FAILURE_KIND[channel_name] = failure_kind
+    if failure_kind == "bot_check":
         set_state(channel_name, last_error="blocked by YouTube (bot check)", backoff_seconds=300,
                   blocked_since=STATE.get(channel_name, {}).get("blocked_since") or time.time())
     return None
@@ -420,8 +443,8 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         "--hls-use-mpegts", "--hls-prefer-native",
         "--skip-unavailable-fragments", "--fragment-retries", "3",
         "--live-from-start",
-        "--retries", "3", "--extractor-retries", "3", "--file-access-retries", "3",
-        "--retry-sleep", "5", "--socket-timeout", "10",
+        "--retries", "3", "--extractor-retries", "10", "--file-access-retries", "3",
+        "--retry-sleep", "5", "--retry-sleep", "extractor:exp=2:30", "--socket-timeout", "10",
         "--no-part", "--force-overwrites",
         "-o", output_template, video_url,
     ]
@@ -530,6 +553,7 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
                 output_tail = [line for line in output_lines if line.strip()][-15:]
                 for line in output_tail:
                     log(channel_name, line)
+                proxy_failed = _proxy_failure_in_output("\n".join(output_lines))
                 try:
                     channel_url = STATE.get(channel_name, {}).get("url")
                     live_info = check_live(channel_url, proxy, channel_name) if channel_url else None
@@ -537,7 +561,10 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
                 except Exception:
                     live_info = None
                     check_failed = True
-                if check_failed:
+                if proxy_failed:
+                    summary = "yt-dlp stopped because the proxy failed; the stream may still be live; will retry"
+                    set_state(channel_name, last_error=None, backoff_seconds=0)
+                elif check_failed:
                     summary = f"yt-dlp finished with code {return_code} (normal at stream end; live status unknown); recording saved"
                 elif live_info and live_info.get("video_id") == video_id:
                     summary = f"yt-dlp ended early (code {return_code}) while the stream is still live; recording saved, a new recording will start"
@@ -574,7 +601,8 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
             set_state(channel_name, last_error=message)
             cleanup_empty_recording_files(output_dir, base_name)
             return False
-        if duration < 120 and not stopped_by_user:
+        if duration < 120 and not stopped_by_user and not (
+                return_code and _proxy_failure_in_output("\n".join(output_lines))):
             message = f"recording ended after {duration}s (under 120s)"
             log(channel_name, message)
             set_state(channel_name, last_error=message)

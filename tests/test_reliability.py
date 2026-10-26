@@ -55,6 +55,7 @@ def clean_state(monkeypatch):
     server.FALLBACK_CHECK_AT.clear()
     server.FALLBACK_NOT_LIVE_AT.clear()
     server.FALLBACK_LAST_SUMMARY.clear()
+    server.FALLBACK_FAILURE_KIND.clear()
     server.WORKING_CLIENTS.clear()
     monkeypatch.setattr(server, "log", lambda name, message: server.LOG_BUFFER.append(message))
 
@@ -133,6 +134,42 @@ def test_bot_check_is_blocked_and_rate_limited(monkeypatch):
     blocked_lines = [line for line in server.LOG_BUFFER if "blocked by YouTube" in line]
     assert len(blocked_lines) == 1
     assert server.log_level(blocked_lines[0]) == "WARNING"
+
+
+@pytest.mark.parametrize(("outcomes", "expected"), [
+    ([], "transient"),
+    (["error"], "transient"),
+    (["not_live"], "not_live"),
+    (["error", "not_live"], "not_live"),
+    (["bot_check"], "bot_check"),
+    (["not_live", "bot_check"], "bot_check"),
+])
+def test_fallback_failure_kind(outcomes, expected):
+    assert server._fallback_failure_kind(outcomes) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "Unable to connect to proxy: HTTP Error 503",
+    "unable to CONNECT TO PROXY: refused",
+    "Tunnel connection failed: 503",
+    "tUnNeL CoNnEcTiOn FaIlEd",
+])
+def test_proxy_failure_output_case_insensitive(text):
+    assert server._proxy_failure_in_output(text)
+
+
+def test_proxy_failure_output_rejects_unrelated_text():
+    assert not server._proxy_failure_in_output("network connection failed")
+
+
+def test_transient_fallback_failure_uses_one_minute_backoff(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(bot_check_html()))
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=1, stdout="", stderr="Unable to connect to proxy: 503"))
+    assert server.check_live("https://youtube.com/@a/live", "http://proxy", "a") is None
+    assert server.STATE["a"]["last_error"] == "live check failed (proxy or network)"
+    assert server.STATE["a"]["backoff_seconds"] == 60
+    assert server.STATE["a"].get("blocked_since", 0.0) == 0.0
 
 
 def test_garbage_page_remains_unexpected(monkeypatch):
@@ -395,6 +432,8 @@ def test_recording_bot_check_retries_once_with_next_client(tmp_path, monkeypatch
 
 def test_blocked_check_followed_by_offline_page_recovers_once(monkeypatch):
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(bot_check_html()))
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=1, stdout="", stderr="Sign in to confirm that you're not a bot"))
     server.check_live("https://youtube.com/@a/live", "", "a")
     offline = '<script>ytInitialData = {}; ytInitialPlayerResponse,a.ytInitialReelWatchSequenceResponse;</script>'
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response(offline))
