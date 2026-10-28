@@ -353,7 +353,7 @@ def test_fallback_live_kind_uses_sixty_second_cooldown(monkeypatch):
     server.FALLBACK_CHECK_AT["a"] = now[0] - 5
     assert server.fallback_check_live("https://youtube.com/@a/live", "", "a") is None
     assert calls == []
-    server.FALLBACK_CHECK_AT.pop("a")
+    now[0] += 56  # 61 s since the last check
     server.fallback_check_live("https://youtube.com/@a/live", "", "a")
     assert len(calls) == 4
 
