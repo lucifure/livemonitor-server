@@ -343,6 +343,21 @@ def test_fallback_later_live_client_clears_not_live_conclusion(monkeypatch):
     assert "a" not in server.FALLBACK_NOT_LIVE_AT
 
 
+def test_fallback_live_kind_uses_sixty_second_cooldown(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(server.time, "time", lambda: now[0])
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append(args[0]) or SimpleNamespace(
+        returncode=1, stdout="", stderr="temporary error"))
+    server.FALLBACK_FAILURE_KIND["a"] = "live"
+    server.FALLBACK_CHECK_AT["a"] = now[0] - 5
+    assert server.fallback_check_live("https://youtube.com/@a/live", "", "a") is None
+    assert calls == []
+    server.FALLBACK_CHECK_AT.pop("a")
+    server.fallback_check_live("https://youtube.com/@a/live", "", "a")
+    assert len(calls) == 4
+
+
 def test_fallback_summary_throttles_unchanged_and_logs_changed(monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(server.time, "time", lambda: now[0])
@@ -444,13 +459,13 @@ def test_blocked_check_followed_by_offline_page_recovers_once(monkeypatch):
     assert server.log_level(recovery[0]) == "INFO"
 
 
-def _record_stream_with_saved_file(tmp_path, monkeypatch, size, duration, live_check=None):
+def _record_stream_with_saved_file(tmp_path, monkeypatch, size, duration, live_check=None, output=None):
     server.GLOBALS["min_free_gb"] = 0
     server.set_state("a", url="https://youtube.com/@a/live", last_error=None)
     monkeypatch.setattr(server.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**12))
     monkeypatch.setattr(server, "sanitize_filename", lambda title: "show")
     monkeypatch.setattr(server, "datetime", SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda fmt: "01012026" if "%d" in fmt else "00-00-00")))
-    output = "".join(f"line {n}\n" for n in range(1, 21))
+    output = output if output is not None else "".join(f"line {n}\n" for n in range(1, 21))
     monkeypatch.setattr(server.subprocess, "Popen", lambda *args, **kwargs: FakeProcess(1, output))
     if live_check is not None:
         monkeypatch.setattr(server, "check_live", live_check)
@@ -465,6 +480,7 @@ def _record_stream_with_saved_file(tmp_path, monkeypatch, size, duration, live_c
 
 
 def test_nonzero_exit_with_good_saved_recording_still_live_logs_15_lines(tmp_path, monkeypatch):
+    server.FALLBACK_CHECK_AT["a"] = 123.0
     assert _record_stream_with_saved_file(
         tmp_path, monkeypatch, 1024 * 1024, 120,
         live_check=lambda *args: {"video_id": "abc", "title": "show"}) is True
@@ -472,9 +488,20 @@ def test_nonzero_exit_with_good_saved_recording_still_live_logs_15_lines(tmp_pat
     assert not any("yt-dlp failed" in line for line in server.LOG_BUFFER)
     summary = "yt-dlp ended early (code 1) while the stream is still live; recording saved, a new recording will start"
     assert summary in server.LOG_BUFFER
+    assert "a" not in server.FALLBACK_CHECK_AT
     assert server.LOG_BUFFER.index("line 6") < server.LOG_BUFFER.index(summary)
     assert [line for line in server.LOG_BUFFER if line.startswith("line ")] == [
         f"line {n}" for n in range(6, 21)]
+
+
+def test_nonzero_exit_with_good_saved_recording_proxy_failure_clears_fallback_cooldown(tmp_path, monkeypatch):
+    server.FALLBACK_CHECK_AT["a"] = 123.0
+    assert _record_stream_with_saved_file(
+        tmp_path, monkeypatch, 1024 * 1024, 120,
+        output="ERROR: Unable to connect to proxy\n") is True
+    summary = "yt-dlp stopped because the proxy failed; the stream may still be live; will retry"
+    assert summary in server.LOG_BUFFER
+    assert "a" not in server.FALLBACK_CHECK_AT
 
 
 def test_nonzero_exit_with_good_saved_recording_offline_logs_normal_summary(tmp_path, monkeypatch):

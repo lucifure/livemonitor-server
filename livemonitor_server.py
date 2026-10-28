@@ -324,7 +324,7 @@ def _log_fallback_summary(channel_name, outcomes, live_info=None):
 
 def fallback_check_live(channel_url, proxy, channel_name):
     now = time.time()
-    cooldown = 60 if FALLBACK_FAILURE_KIND.get(channel_name) in ("transient", "not_live") else 300
+    cooldown = 60 if FALLBACK_FAILURE_KIND.get(channel_name) in ("transient", "not_live", "live") else 300
     if channel_name in FALLBACK_CHECK_AT and now - FALLBACK_CHECK_AT[channel_name] < cooldown:
         return None
     FALLBACK_CHECK_AT[channel_name] = now
@@ -563,11 +563,13 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
                     check_failed = True
                 if proxy_failed:
                     summary = "yt-dlp stopped because the proxy failed; the stream may still be live; will retry"
+                    FALLBACK_CHECK_AT.pop(channel_name, None)
                     set_state(channel_name, last_error=None, backoff_seconds=0)
                 elif check_failed:
                     summary = f"yt-dlp finished with code {return_code} (normal at stream end; live status unknown); recording saved"
                 elif live_info and live_info.get("video_id") == video_id:
                     summary = f"yt-dlp ended early (code {return_code}) while the stream is still live; recording saved, a new recording will start"
+                    FALLBACK_CHECK_AT.pop(channel_name, None)
                 else:
                     summary = f"yt-dlp finished with code {return_code} (normal at stream end); recording saved"
                 log(channel_name, summary)
