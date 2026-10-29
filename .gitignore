@@ -8,3 +8,4 @@ __pycache__/
 *.part
 .venv/
 .pytest_cache/
+ytdlp-logs/

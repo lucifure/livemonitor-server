@@ -830,6 +830,32 @@ def test_output_reader_keeps_only_last_200_lines():
     assert lines[-1] == "line 249"
 
 
+def test_output_reader_saves_timestamped_log_masks_proxy_and_filters_debug(tmp_path):
+    from collections import deque
+    lines = deque(maxlen=200)
+    path = tmp_path / "recording.log"
+    stream = io.StringIO("[debug] proxy http://user:secret@example.test:8080\nERROR: failed\n")
+    server.read_process_output(stream, lines, str(path), "http://user:secret@example.test:8080")
+    saved = path.read_text()
+    assert "[20" in saved and "] [debug] proxy http://[masked]@example.test:8080" in saved
+    assert "] ERROR: failed" in saved
+    assert list(lines) == ["ERROR: failed"]
+    assert "secret" not in saved
+
+
+def test_prune_ytdlp_logs_keeps_newest_20(tmp_path):
+    paths = []
+    for index in range(25):
+        path = tmp_path / f"{index:02}.log"
+        path.write_text(str(index))
+        os.utime(path, (index, index))
+        paths.append(path)
+    server.prune_ytdlp_logs(str(tmp_path), keep=20)
+    assert len(list(tmp_path.glob("*.log"))) == 20
+    assert all(not paths[index].exists() for index in range(5))
+    assert all(paths[index].exists() for index in range(5, 25))
+
+
 def test_pause_returns_without_waiting_for_active_recording(tmp_path, monkeypatch):
     config = tmp_path / "config.json"
     config.write_text(json.dumps({"channels": [{"name": "a", "url": "https://youtube.com/@a"}]}))

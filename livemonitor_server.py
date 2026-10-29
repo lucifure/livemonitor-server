@@ -434,11 +434,19 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         return False
     now = datetime.now()
     base_name = sanitize_filename(title) + "_" + now.strftime("%d%m%Y") + "_" + now.strftime("%H-%M-%S")
+    debug_dir = os.path.join(PROJECT_DIR, "ytdlp-logs")
+    os.makedirs(debug_dir, exist_ok=True)
+    debug_path = os.path.join(debug_dir, base_name + ".log")
+    try:
+        prune_ytdlp_logs(debug_dir, keep=19)
+    except OSError as error:
+        log(channel_name, f"Could not prune old yt-dlp debug logs: {error}")
+    log(channel_name, f"yt-dlp debug log: {debug_path}")
     output_template = os.path.join(output_dir, base_name + ".%(ext)s")
     video_url = f"https://youtube.com/watch?v={video_id}"
 
     cmd = [
-        YTDLP_BIN, "--force-ipv4", "--no-update",
+        YTDLP_BIN, "-v", "--force-ipv4", "--no-update",
         "-f", format_selector(quality),
         "--hls-use-mpegts", "--hls-prefer-native",
         "--skip-unavailable-fragments", "--fragment-retries", "3",
@@ -475,7 +483,7 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         output_lines = deque(maxlen=200)
 
         reader = threading.Thread(target=read_process_output,
-                                  args=(process.stdout, output_lines), daemon=True)
+                                  args=(process.stdout, output_lines, debug_path, proxy), daemon=True)
         reader.start()
         while process.poll() is None:
             if stop_now and stop_now.is_set():
@@ -795,13 +803,33 @@ def cleanup_empty_recording_files(output_dir, base_name):
         log("server", f"Could not clean empty recording leftovers for {base_name}: {error}")
 
 
-def read_process_output(stream, output_lines):
-    """Drain subprocess output continuously while retaining only its last 200 lines."""
+def read_process_output(stream, output_lines, debug_path=None, proxy=""):
+    """Save complete yt-dlp output and retain non-debug lines for existing summaries."""
     try:
         for line in stream:
-            output_lines.append(line.rstrip("\r\n"))
+            line = line.rstrip("\r\n")
+            if proxy:
+                line = re.sub(r"://[^/@\s]+@", "://[masked]@", line)
+            if debug_path:
+                try:
+                    with open(debug_path, "a", encoding="utf-8") as debug_file:
+                        debug_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {line}\n")
+                except OSError:
+                    pass
+            if not line.startswith("[debug]"):
+                output_lines.append(line)
     except (OSError, ValueError):
         pass
+
+
+def prune_ytdlp_logs(debug_dir, keep=20):
+    """Keep only the newest requested number of per-recording log files."""
+    old_logs = sorted(
+        (os.path.join(debug_dir, name) for name in os.listdir(debug_dir)
+         if name.endswith(".log") and os.path.isfile(os.path.join(debug_dir, name))),
+        key=os.path.getmtime, reverse=True)
+    for old_path in old_logs[keep:]:
+        os.remove(old_path)
 
 
 def monitor_channel(channel):
