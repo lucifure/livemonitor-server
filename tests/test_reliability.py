@@ -843,6 +843,33 @@ def test_output_reader_saves_timestamped_log_masks_proxy_and_filters_debug(tmp_p
     assert "secret" not in saved
 
 
+def test_output_reader_saves_tracebacks_but_excludes_them_from_output_tail(tmp_path):
+    from collections import deque
+    lines = deque(maxlen=200)
+    path = tmp_path / "traceback.log"
+    sample = (
+        "ERROR: failed request\n"
+        "Traceback (most recent call last):\n"
+        "  File \"extractor.py\", line 1, in extract\n"
+        "    raise ValueError()\n"
+        "    ^^^^^^^^^^^^^^^^^\n"
+        "During handling of the above exception, another exception occurred:\n"
+        "The above exception was the direct cause of the following exception:\n"
+        "\tFile \"wrapper.py\", line 2\n"
+        "\n"
+        "WARNING: retrying\n"
+    )
+    server.read_process_output(io.StringIO(sample), lines, str(path))
+    saved = path.read_text()
+    assert "Traceback (most recent call last):" in saved
+    assert "  File \"extractor.py\"" in saved
+    assert "    ^^^^^^^^^^^^^^^^^" in saved
+    assert "During handling of the above exception" in saved
+    assert "The above exception was the direct cause" in saved
+    assert "\tFile \"wrapper.py\"" in saved
+    assert list(lines) == ["ERROR: failed request", "WARNING: retrying"]
+
+
 def test_prune_ytdlp_logs_keeps_newest_20(tmp_path):
     paths = []
     for index in range(25):

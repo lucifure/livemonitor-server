@@ -816,7 +816,12 @@ def read_process_output(stream, output_lines, debug_path=None, proxy=""):
                         debug_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {line}\n")
                 except OSError:
                     pass
-            if not line.startswith("[debug]"):
+            traceback_lines = (
+                "Traceback (most recent call last)",
+                "During handling of the above exception",
+                "The above exception was the direct cause",
+            )
+            if (line and not line.startswith(("[debug]", " ", "\t") + traceback_lines)):
                 output_lines.append(line)
     except (OSError, ValueError):
         pass
