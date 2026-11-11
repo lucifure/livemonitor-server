@@ -1,4 +1,4 @@
-import hmac, json, os, re, shutil, threading, time
+import hashlib, hmac, json, os, queue, re, shutil, subprocess, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote, quote
 
@@ -32,6 +32,76 @@ def start_api(config, ctx):
         return any(name.startswith(p + ".") for p in ctx["active_prefixes"]())
 
     output_root = os.path.realpath(output_dir)
+    thumbs_dir = config.get("thumbs_dir", os.path.expanduser("~/livemonitor-server/thumbs"))
+    if os.path.commonpath((output_root, os.path.realpath(thumbs_dir))) == output_root:
+        thumbs_dir = os.path.join(os.path.dirname(output_root), "thumbs")
+    video_extensions = (".mp4", ".mkv", ".ts")
+    duration_cache = {}
+    cache_lock = threading.Lock()
+    pending = set()
+    work_queue = queue.Queue()
+
+    def cache_key(name, size, modified):
+        return (name, size, modified)
+
+    def thumbnail_path(name, size, modified):
+        digest = hashlib.sha1(f"{name}|{size}|{modified}".encode()).hexdigest()
+        return os.path.join(thumbs_dir, digest + ".jpg")
+
+    def enqueue(name, path, size, modified):
+        key = cache_key(name, size, modified)
+        with cache_lock:
+            if key not in duration_cache and key not in pending:
+                pending.add(key)
+                work_queue.put((key, path, name))
+
+    def media_worker():
+        while True:
+            key, fpath, name = work_queue.get()
+            try:
+                # Listings observed while any recording was active are not
+                # probed; the next listing can enqueue them once recordings stop.
+                if in_progress(name) or ctx["active_prefixes"]():
+                    continue
+                try:
+                    result = subprocess.run(
+                        ["nice", "-n", "19", "ffprobe", "-v", "error", "-show_entries",
+                         "format=duration", "-of", "csv=p=0", fpath],
+                        capture_output=True, text=True, timeout=30, check=True)
+                    seconds = int(float(result.stdout.strip()))
+                    duration = max(0, seconds)
+                except Exception as error:
+                    duration = None
+                    ctx["log"](f"ffprobe failed for {name}: {error}")
+                with cache_lock:
+                    duration_cache[key] = duration
+                thumb = thumbnail_path(*key)
+                try:
+                    os.makedirs(thumbs_dir, exist_ok=True)
+                    timestamp = 0 if duration is None or duration < 10 else min(60, duration * 0.1)
+                    result = subprocess.run(
+                        ["nice", "-n", "19", "ffmpeg", "-v", "error", "-y", "-ss", str(timestamp),
+                         "-i", fpath, "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "5", thumb],
+                        capture_output=True, text=True, timeout=60, check=True)
+                    if not os.path.isfile(thumb) or os.path.getsize(thumb) <= 0:
+                        raise RuntimeError("ffmpeg produced no thumbnail")
+                    files = sorted((os.path.join(thumbs_dir, f) for f in os.listdir(thumbs_dir)
+                                    if f.endswith(".jpg") and os.path.isfile(os.path.join(thumbs_dir, f))),
+                                   key=os.path.getmtime, reverse=True)
+                    for old in files[300:]:
+                        try: os.remove(old)
+                        except OSError: pass
+                except Exception as error:
+                    try:
+                        if os.path.exists(thumb): os.remove(thumb)
+                    except OSError: pass
+                    ctx["log"](f"thumbnail failed for {name}: {error}")
+            finally:
+                with cache_lock:
+                    pending.discard(key)
+                work_queue.task_done()
+
+    threading.Thread(target=media_worker, daemon=True).start()
 
     def safe_path(raw_name):
         name = unquote(raw_name)
@@ -116,16 +186,30 @@ def start_api(config, ctx):
                             if entry.is_symlink():
                                 continue
                             st = entry.stat()
+                            progress = in_progress(entry.name)
+                            key = cache_key(entry.name, st.st_size, int(st.st_mtime))
+                            duration = None
+                            if entry.name.lower().endswith(video_extensions) and not progress:
+                                with cache_lock:
+                                    duration = duration_cache.get(key)
+                                    cached = key in duration_cache
+                                if not cached:
+                                    # Any active recording defers all media work until a later listing.
+                                    if not ctx["active_prefixes"]():
+                                        enqueue(entry.name, entry.path, st.st_size, int(st.st_mtime))
                             items.append({
                                 "name": entry.name,
                                 "size": st.st_size,
                                 "modified": int(st.st_mtime),
-                                "in_progress": in_progress(entry.name),
+                                "in_progress": progress,
+                                "duration": duration,
                             })
                 items.sort(key=lambda x: x["modified"], reverse=True)
                 return self.send_json(200, {"recordings": items})
             if path.startswith("/recordings/"):
                 return self.download(path[len("/recordings/"):])
+            if path.startswith("/thumbnails/"):
+                return self.thumbnail(path[len("/thumbnails/"):])
             return self.send_json(404, {"error": "not found"})
 
         def download(self, raw_name):
@@ -177,6 +261,22 @@ def start_api(config, ctx):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+        def thumbnail(self, raw_name):
+            name, fpath = safe_path(raw_name)
+            if not name or in_progress(name) or not name.lower().endswith(video_extensions):
+                return self.send_json(404, {"error": "not found"})
+            st = os.stat(fpath)
+            thumb = thumbnail_path(name, st.st_size, int(st.st_mtime))
+            if not os.path.isfile(thumb) or os.path.getsize(thumb) <= 0:
+                return self.send_json(404, {"error": "not found"})
+            size = os.path.getsize(thumb)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            with open(thumb, "rb") as image:
+                shutil.copyfileobj(image, self.wfile)
+
         def do_POST(self):
             if not self.authorized():
                 return self.send_json(401, {"error": "unauthorized"})
@@ -227,10 +327,16 @@ def start_api(config, ctx):
                     return self.send_json(404, {"error": "not found"})
                 if in_progress(name):
                     return self.send_json(409, {"error": "recording in progress"})
+                st = os.stat(fpath)
                 try:
                     os.remove(fpath)
                 except OSError as e:
                     return self.send_json(500, {"error": str(e)})
+                try:
+                    thumb = thumbnail_path(name, st.st_size, int(st.st_mtime))
+                    if os.path.exists(thumb): os.remove(thumb)
+                except OSError:
+                    pass
                 ctx["log"](f"API: deleted recording {name}")
                 return self.send_json(200, {"deleted": name})
             if path.startswith("/channels/"):

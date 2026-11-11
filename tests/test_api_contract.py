@@ -2,7 +2,9 @@
 import http.client
 import json
 import os
+import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -10,7 +12,7 @@ import api_server
 
 
 @contextmanager
-def api(tmp_path, status=None, active=(), pause_callback=None, log_lines=None):
+def api(tmp_path, status=None, active=(), pause_callback=None, log_lines=None, thumbs_dir=None):
     calls = []
     stored_logs = ["one", "two"] if log_lines is None else log_lines
     def clear_logs():
@@ -29,7 +31,7 @@ def api(tmp_path, status=None, active=(), pause_callback=None, log_lines=None):
         "pause_channel": pause_callback or (lambda n: n == "alpha"),
         "resume_channel": lambda n: n == "alpha",
     }
-    server = api_server.start_api({"api_token": "test-token", "output_dir": str(tmp_path), "api_bind": "127.0.0.1", "api_port": 0}, ctx)
+    server = api_server.start_api({"api_token": "test-token", "output_dir": str(tmp_path), "thumbs_dir": str(thumbs_dir or tmp_path.parent / "thumbs"), "api_bind": "127.0.0.1", "api_port": 0}, ctx)
     try:
         yield server, calls
     finally:
@@ -61,7 +63,11 @@ def test_existing_api_response_shapes_and_status_codes(tmp_path):
         status, _, data = request(server, "GET", "/recordings")
         assert status == 200
         assert {"recordings"} == json.loads(data).keys()
-        assert {"name", "size", "modified", "in_progress"} == json.loads(data)["recordings"][0].keys()
+        row = json.loads(data)["recordings"][0]
+        assert {"name", "size", "modified", "in_progress", "duration"} == row.keys()
+        assert isinstance(row["name"], str) and isinstance(row["size"], int)
+        assert isinstance(row["modified"], int) and isinstance(row["in_progress"], bool)
+        assert row["duration"] is None
 
         status, _, data = request(server, "GET", "/logs?limit=1")
         decoded_logs = json.loads(data)
@@ -159,3 +165,85 @@ def test_delete_logs_requires_token_and_clears_buffer(tmp_path):
         status, _, payload = request(server, "GET", "/logs")
         assert status == 200
         assert json.loads(payload)["lines"] == ["Server log cleared from the app."]
+
+
+def wait_for(predicate):
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def fake_media(monkeypatch, duration="12.8", fail_probe=False, make_thumb=True):
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        if "ffprobe" in args:
+            if fail_probe:
+                raise subprocess.CalledProcessError(1, args)
+            return SimpleNamespace(stdout=duration)
+        if make_thumb:
+            open(args[-1], "wb").write(b"jpeg")
+        return SimpleNamespace(stdout="")
+    monkeypatch.setattr(api_server.subprocess, "run", run)
+    return calls
+
+
+def test_duration_worker_cache_and_thumbnail_lifecycle(tmp_path, monkeypatch):
+    calls = fake_media(monkeypatch)
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    thumbs = tmp_path.parent / (tmp_path.name + "-thumbs")
+    with api(tmp_path, thumbs_dir=thumbs) as (server, _):
+        status, _, payload = request(server, "GET", "/recordings")
+        row = json.loads(payload)["recordings"][0]
+        assert status == 200 and row["duration"] is None
+        assert wait_for(lambda: any("ffprobe" in c for c in calls) and any("ffmpeg" in c for c in calls))
+        status, _, payload = request(server, "GET", "/recordings")
+        row = json.loads(payload)["recordings"][0]
+        assert row["duration"] == 12
+        assert set(row) == {"name", "size", "modified", "in_progress", "duration"}
+        assert len(json.loads(payload)["recordings"]) == 1
+        status, headers, body = request(server, "GET", "/thumbnails/clip.mp4")
+        assert status == 200 and headers["Content-Type"] == "image/jpeg"
+        assert int(headers["Content-Length"]) == len(body) == 4
+        assert len([c for c in calls if "ffprobe" in c]) == 1
+        assert len([c for c in calls if "ffmpeg" in c]) == 1
+        status, _, payload = request(server, "DELETE", "/recordings/clip.mp4")
+        assert status == 200
+        assert not list(thumbs.glob("*.jpg"))
+        assert json.loads(request(server, "GET", "/recordings")[2])["recordings"] == []
+
+
+def test_media_worker_skips_active_and_caches_probe_failure(tmp_path, monkeypatch):
+    calls = fake_media(monkeypatch, fail_probe=True)
+    active_file = tmp_path / "active.mp4"
+    active_file.write_bytes(b"active")
+    with api(tmp_path, active=("active",)) as (server, _):
+        request(server, "GET", "/recordings")
+        time.sleep(0.05)
+        assert not calls
+    active_file.unlink()
+    failed = tmp_path / "failed.mkv"
+    failed.write_bytes(b"video")
+    with api(tmp_path) as (server, log_calls):
+        status, _, payload = request(server, "GET", "/recordings")
+        assert json.loads(payload)["recordings"][0]["duration"] is None
+        assert wait_for(lambda: any("ffprobe" in c for c in calls))
+        request(server, "GET", "/recordings")
+        time.sleep(0.05)
+        assert len([c for c in calls if "ffprobe" in c]) == 1
+        assert any("ffprobe failed" in line for line in log_calls)
+
+
+def test_thumbnail_auth_validation_and_in_progress(tmp_path, monkeypatch):
+    (tmp_path / "active.mp4").write_bytes(b"video")
+    (tmp_path / "text.txt").write_bytes(b"text")
+    with api(tmp_path, active=("active",)) as (server, _):
+        status, _, payload = request(server, "GET", "/thumbnails/active.mp4", token=None)
+        assert (status, json.loads(payload)) == (401, {"error": "unauthorized"})
+        for name in ("missing.mp4", "active.mp4", "text.txt", "../active.mp4"):
+            status, _, payload = request(server, "GET", "/thumbnails/" + name)
+            assert (status, json.loads(payload)) == (404, {"error": "not found"})
