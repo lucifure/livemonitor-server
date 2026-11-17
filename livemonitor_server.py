@@ -4,6 +4,7 @@ from collections import deque
 from datetime import datetime
 
 import api_server
+from ytdlp_log_summary import summarize_ytdlp_log
 
 log_level = api_server.log_level
 
@@ -66,6 +67,15 @@ def log(channel_name, message):
     with LOG_LOCK:
         LOG_BUFFER.append(line)
     print(line, flush=True)
+
+
+def log_ytdlp_summary(channel_name, debug_path):
+    """Write a short summary of the yt-dlp debug log into the server log."""
+    try:
+        for line in summarize_ytdlp_log(debug_path):
+            log(channel_name, line)
+    except Exception as error:
+        log(channel_name, f"Could not summarise the yt-dlp debug log: {error}")
 
 
 def get_logs(limit):
@@ -552,6 +562,7 @@ def record_stream(channel_name, video_id, title, proxy, output_dir, quality):
         set_state(channel_name, status="finalizing")
         finalized_path = finalize_recording_output(output_dir, base_name, channel_name)
         cleanup_empty_recording_files(output_dir, base_name)
+        log_ytdlp_summary(channel_name, debug_path)
         if return_code and not stopped_by_user:
             usable_saved_file = (finalized_path is not None and finalized_path is not False
                                  and os.path.isfile(finalized_path)
