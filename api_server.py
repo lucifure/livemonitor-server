@@ -59,9 +59,9 @@ def start_api(config, ctx):
         while True:
             key, fpath, name = work_queue.get()
             try:
-                # Listings observed while any recording was active are not
-                # probed; the next listing can enqueue them once recordings stop.
-                if in_progress(name) or ctx["active_prefixes"]():
+                # Files still being written are skipped; finished files are probed
+                # even while another channel records (one at a time, at nice 19).
+                if in_progress(name):
                     continue
                 try:
                     result = subprocess.run(
@@ -100,6 +100,8 @@ def start_api(config, ctx):
                 with cache_lock:
                     pending.discard(key)
                 work_queue.task_done()
+                if ctx["active_prefixes"]():
+                    time.sleep(2)  # be gentle with a running recording
 
     threading.Thread(target=media_worker, daemon=True).start()
 
@@ -194,9 +196,7 @@ def start_api(config, ctx):
                                     duration = duration_cache.get(key)
                                     cached = key in duration_cache
                                 if not cached:
-                                    # Any active recording defers all media work until a later listing.
-                                    if not ctx["active_prefixes"]():
-                                        enqueue(entry.name, entry.path, st.st_size, int(st.st_mtime))
+                                    enqueue(entry.name, entry.path, st.st_size, int(st.st_mtime))
                             items.append({
                                 "name": entry.name,
                                 "size": st.st_size,

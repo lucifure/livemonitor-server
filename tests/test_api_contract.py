@@ -247,3 +247,18 @@ def test_thumbnail_auth_validation_and_in_progress(tmp_path, monkeypatch):
         for name in ("missing.mp4", "active.mp4", "text.txt", "../active.mp4"):
             status, _, payload = request(server, "GET", "/thumbnails/" + name)
             assert (status, json.loads(payload)) == (404, {"error": "not found"})
+
+
+def test_finished_file_is_probed_while_another_recording_is_active(tmp_path, monkeypatch):
+    calls = fake_media(monkeypatch)
+    (tmp_path / "done.mkv").write_bytes(b"video")
+    (tmp_path / "live.mkv").write_bytes(b"growing")
+    thumbs = tmp_path.parent / (tmp_path.name + "-thumbs-active")
+    with api(tmp_path, active=("live",), thumbs_dir=thumbs) as (server, _):
+        request(server, "GET", "/recordings")
+        assert wait_for(lambda: any("ffprobe" in c for c in calls))
+        assert wait_for(lambda: any("ffmpeg" in c for c in calls))
+        rows = {r["name"]: r for r in json.loads(request(server, "GET", "/recordings")[2])["recordings"]}
+        assert rows["done.mkv"]["duration"] == 12
+        assert rows["live.mkv"]["duration"] is None and rows["live.mkv"]["in_progress"] is True
+        assert all(c[-1] != str(tmp_path / "live.mkv") and "live.mkv" not in " ".join(map(str, c)) for c in calls)
